@@ -3,85 +3,95 @@ name: Windows portable build
 on:
   workflow_dispatch:
   push:
-    tags: ["v*"]
+    branches: [ main ]
+    paths:
+      - "apps/**"
+      - "shared/**"
+      - "paperrepo/**"
+      - "packaging/**"
+      - "vendor/**"
+      - "requirements.txt"
+      - ".github/workflows/windows-build.yml"
 
 jobs:
   build:
     runs-on: windows-latest
-    env:
-      TECTONIC_VER: "0.15.0"
+    defaults:
+      run:
+        shell: pwsh
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # (1) Tải Tectonic cho Windows và copy vào vendor/tectonic/windows-x86_64/tectonic.exe
+      - name: Download Tectonic (Windows)
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ver   = '0.15.0'
+          $url   = "https://github.com/tectonic-typesetting/tectonic/releases/download/tectonic%40$ver/tectonic-$ver-x86_64-pc-windows-msvc.zip"
+          $zip   = Join-Path $env:RUNNER_TEMP "tectonic.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+
+          $dest  = Join-Path $env:RUNNER_TEMP "tectonic"
+          if (Test-Path $dest) { Remove-Item -Recurse -Force $dest }
+          Expand-Archive -Path $zip -DestinationPath $dest
+
+          # TÌM FILE, không phải folder
+          $exe = Get-ChildItem -Path $dest -Filter 'tectonic.exe' -File -Recurse | Select-Object -First 1
+          if (-not $exe) { throw "tectonic.exe not found under $dest" }
+
+          New-Item -ItemType Directory -Force -Path "vendor\tectonic\windows-x86_64" | Out-Null
+          Copy-Item $exe.FullName "vendor\tectonic\windows-x86_64\tectonic.exe" -Force
+
+      - name: Show tectonic in repo
+        run: |
+          Get-ChildItem -Recurse vendor\tectonic | Select FullName,Length
+
+      # (2) Python & deps
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: '3.11'   # PyInstaller trên Windows ổn định nhất với 3.10/3.11
 
       - name: Install dependencies
-        shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
 
-      # Đặt đúng tectonic.exe vào vendor/tectonic/windows-x86_64/
-      - name: Fetch Tectonic (Windows)
-        shell: pwsh
+      # (3) Build portable EXE (không cần Inno Setup)
+      - name: Build Student (portable)
         run: |
-          $ErrorActionPreference = 'Stop'
-          New-Item -ItemType Directory -Force -Path vendor\tectonic\windows-x86_64 | Out-Null
-          $url = "https://github.com/tectonic-typesetting/tectonic/releases/download/tectonic%40${env:TECTONIC_VER}/tectonic-${env:TECTONIC_VER}-x86_64-pc-windows-msvc.zip"
-          Invoke-WebRequest -Uri $url -OutFile tectonic.zip
-          Expand-Archive tectonic.zip -DestinationPath vendor\tectonic\windows-x86_64 -Force
-          $folder = Get-ChildItem vendor\tectonic\windows-x86_64 | Where-Object { $_.PSIsContainer -and $_.Name -like "tectonic-*" } | Select-Object -First 1
-          Copy-Item "$($folder.FullName)\tectonic.exe" vendor\tectonic\windows-x86_64\tectonic.exe -Force
-          Remove-Item tectonic.zip
-
-      - name: Build Student (PyInstaller)
-        shell: pwsh
+          pyinstaller -y packaging\win_student.spec
+      - name: Build Supervisor (portable)
         run: |
-          $ErrorActionPreference = 'Stop'
-          pyinstaller packaging\win_student.spec --noconfirm
+          pyinstaller -y packaging\win_supervisor.spec
 
-      - name: Build Supervisor (PyInstaller)
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          pyinstaller packaging\win_supervisor.spec --noconfirm
-
+      # (4) Liệt kê dist/ để debug nếu có sự cố
       - name: List dist/
-        shell: pwsh
+        if: always()
         run: |
-          Write-Host "==== dist/ tree ===="
-          Get-ChildItem -Recurse -Force dist | ForEach-Object { $_.FullName }
+          Write-Host "== dist tree =="
+          if (Test-Path dist) {
+            Get-ChildItem -Recurse dist | Select FullName,Length
+          } else {
+            Write-Host "dist/ does not exist"
+          }
 
-      - name: Verify expected output folders
-        shell: pwsh
+      # (5) Đóng gói thành artifact
+      - name: Zip portable outputs
         run: |
           $ErrorActionPreference = 'Stop'
-          if (-not (Test-Path "dist\Paperforge-Student")) { throw "Missing dist\Paperforge-Student" }
-          if (-not (Test-Path "dist\Paperforge-Supervisor")) { throw "Missing dist\Paperforge-Supervisor" }
+          New-Item -ItemType Directory -Force -Path out | Out-Null
 
-      - name: Make portable ZIPs
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $ver = if ("${{ github.ref_name }}") { "${{ github.ref_name }}" } else { "dev" }
-          $studentZip = "dist\Paperforge-Student-win64-portable-$ver.zip"
-          $superZip   = "dist\Paperforge-Supervisor-win64-portable-$ver.zip"
-          if (Test-Path $studentZip) { Remove-Item $studentZip -Force }
-          if (Test-Path $superZip)   { Remove-Item $superZip -Force }
-          Compress-Archive -Path "dist\Paperforge-Student\*"   -DestinationPath $studentZip -Force
-          Compress-Archive -Path "dist\Paperforge-Supervisor\*" -DestinationPath $superZip -Force
+          # Tuỳ theo .spec bạn đặt name= gì; dưới đây giả định tạo ra các thư mục dist\Paperforge-Student và dist\Paperforge-Supervisor
+          if (Test-Path "dist\Paperforge-Student")    { Compress-Archive -Path "dist\Paperforge-Student\*"    -DestinationPath "out\Paperforge-Student-portable.zip" }
+          if (Test-Path "dist\Paperforge-Supervisor") { Compress-Archive -Path "dist\Paperforge-Supervisor\*" -DestinationPath "out\Paperforge-Supervisor-portable.zip" }
 
       - name: Upload portable artifacts
         uses: actions/upload-artifact@v4
         with:
           name: windows-portable
-          path: |
-            dist/Paperforge-Student-win64-portable-*.zip
-            dist/Paperforge-Supervisor-win64-portable-*.zip
+          path: out\*.zip
+          if-no-files-found: error
