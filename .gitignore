@@ -3,7 +3,6 @@ __pycache__/
 .build/
 dist/
 build/
-*.spec
 *.log
 .mypy_cache/
 .pyinstaller/
