@@ -1,14 +1,13 @@
-name: Windows build
+name: Windows portable build
 
 on:
-  workflow_dispatch:    # allow manual "Run workflow"
+  workflow_dispatch:
   push:
-    tags: ["v*"]        # auto build when pushing tags like v1.0.0
+    tags: ["v*"]  # chạy khi bạn tag v1.0.0, v1.1.0..., tùy thích
 
 jobs:
   build:
     runs-on: windows-latest
-
     env:
       TECTONIC_VER: "0.15.0"
 
@@ -21,21 +20,21 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install Python deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller PySide6
+          pip install -r requirements.txt
+          pip install pyinstaller
 
-      - name: Prepare vendor Tectonic (download on CI)
+      # Tải Tectonic bản Windows và đặt vào vendor/tectonic/windows-x86_64/tectonic.exe
+      - name: Fetch Tectonic (Windows)
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path vendor\tectonic\windows-x86_64 | Out-Null
           $url = "https://github.com/tectonic-typesetting/tectonic/releases/download/tectonic%40${env:TECTONIC_VER}/tectonic-${env:TECTONIC_VER}-x86_64-pc-windows-msvc.zip"
-          Write-Host "Downloading $url"
           Invoke-WebRequest -Uri $url -OutFile tectonic.zip
           Expand-Archive tectonic.zip -DestinationPath vendor\tectonic\windows-x86_64 -Force
           $folder = Get-ChildItem vendor\tectonic\windows-x86_64 | Where-Object { $_.PSIsContainer -and $_.Name -like "tectonic-*" } | Select-Object -First 1
-          if (-not $folder) { throw "Tectonic folder not found after extraction." }
           Copy-Item "$($folder.FullName)\tectonic.exe" vendor\tectonic\windows-x86_64\tectonic.exe -Force
           Remove-Item tectonic.zip
 
@@ -45,27 +44,49 @@ jobs:
       - name: Build Supervisor (PyInstaller)
         run: pyinstaller packaging\win_supervisor.spec
 
-      - name: Upload portable artefacts
+      # In thêm cây thư mục dist để dễ debug khi tên output khác kỳ vọng
+      - name: List dist/
+        shell: pwsh
+        run: |
+          Write-Host "==== dist/ ===="
+          Get-ChildItem -Recurse -Force dist | ForEach-Object { $_.FullName }
+
+      # Thêm README.txt vào mỗi gói (tuỳ chọn, có thể tạo file này trong repo)
+      - name: Inject README into outputs (optional)
+        if: ${{ hashFiles('packaging/README_windows_portable.txt') != '' }}
+        shell: pwsh
+        run: |
+          $readme = "packaging\README_windows_portable.txt"
+          # tìm thư mục student/supervisor trong dist
+          $studentDir = Get-ChildItem dist -Directory | Where-Object { $_.Name -match 'Student' } | Select-Object -First 1
+          $superDir   = Get-ChildItem dist -Directory | Where-Object { $_.Name -match 'Supervisor' } | Select-Object -First 1
+          if ($studentDir) { Copy-Item $readme "$($studentDir.FullName)\README.txt" -Force }
+          if ($superDir)   { Copy-Item $readme "$($superDir.FullName)\README.txt" -Force }
+
+      # Tạo ZIP portable theo thư mục thực tế trong dist
+      - name: Make portable ZIPs
+        shell: pwsh
+        run: |
+          $ver = if ("${{ github.ref_name }}") { "${{ github.ref_name }}" } else { "dev" }
+          $studentDir = Get-ChildItem dist -Directory | Where-Object { $_.Name -match 'Student' } | Select-Object -First 1
+          $superDir   = Get-ChildItem dist -Directory | Where-Object { $_.Name -match 'Supervisor' } | Select-Object -First 1
+
+          if (-not $studentDir) { throw "Cannot find Student build folder in dist/" }
+          if (-not $superDir)   { throw "Cannot find Supervisor build folder in dist/" }
+
+          $studentZip = "dist\Paperforge-Student-win64-portable-$ver.zip"
+          $superZip   = "dist\Paperforge-Supervisor-win64-portable-$ver.zip"
+
+          if (Test-Path $studentZip) { Remove-Item $studentZip -Force }
+          if (Test-Path $superZip)   { Remove-Item $superZip -Force }
+
+          Compress-Archive -Path "$($studentDir.FullName)\*" -DestinationPath $studentZip -Force
+          Compress-Archive -Path "$($superDir.FullName)\*"   -DestinationPath $superZip   -Force
+
+      - name: Upload portable artifacts
         uses: actions/upload-artifact@v4
         with:
           name: windows-portable
           path: |
-            dist/Paperforge Student/**
-            dist/Paperforge Supervisor/**
-
-      # Optional: create .exe installers with Inno Setup
-      - name: Install Inno Setup
-        run: choco install innosetup -y
-      - name: Build Student Installer
-        run: '"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" packaging\student.iss'
-      - name: Build Supervisor Installer
-        run: '"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" packaging\supervisor.iss'
-
-      - name: Upload installers
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-installers
-          path: |
-            dist/Paperforge-Student-Setup.exe
-            dist/Paperforge-Supervisor-Setup.exe
+            dist/Paperforge-Student-win64-portable-*.zip
+            dist/Paperforge-Supervisor-win64-portable-*.zip
