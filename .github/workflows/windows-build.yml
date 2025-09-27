@@ -3,7 +3,7 @@ name: Windows portable build
 on:
   workflow_dispatch:
   push:
-    tags: ["v*"]  # chạy khi bạn tag v1.0.0, v1.1.0..., tùy thích
+    tags: ["v*"]
 
 jobs:
   build:
@@ -21,15 +21,18 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
+        shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
 
-      # Tải Tectonic bản Windows và đặt vào vendor/tectonic/windows-x86_64/tectonic.exe
+      # Đặt đúng tectonic.exe vào vendor/tectonic/windows-x86_64/
       - name: Fetch Tectonic (Windows)
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force -Path vendor\tectonic\windows-x86_64 | Out-Null
           $url = "https://github.com/tectonic-typesetting/tectonic/releases/download/tectonic%40${env:TECTONIC_VER}/tectonic-${env:TECTONIC_VER}-x86_64-pc-windows-msvc.zip"
           Invoke-WebRequest -Uri $url -OutFile tectonic.zip
@@ -39,49 +42,41 @@ jobs:
           Remove-Item tectonic.zip
 
       - name: Build Student (PyInstaller)
-        run: pyinstaller packaging\win_student.spec
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          pyinstaller packaging\win_student.spec --noconfirm
 
       - name: Build Supervisor (PyInstaller)
-        run: pyinstaller packaging\win_supervisor.spec
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          pyinstaller packaging\win_supervisor.spec --noconfirm
 
-      # In thêm cây thư mục dist để dễ debug khi tên output khác kỳ vọng
       - name: List dist/
         shell: pwsh
         run: |
-          Write-Host "==== dist/ ===="
+          Write-Host "==== dist/ tree ===="
           Get-ChildItem -Recurse -Force dist | ForEach-Object { $_.FullName }
 
-      # Thêm README.txt vào mỗi gói (tuỳ chọn, có thể tạo file này trong repo)
-      - name: Inject README into outputs (optional)
-        if: ${{ hashFiles('packaging/README_windows_portable.txt') != '' }}
+      - name: Verify expected output folders
         shell: pwsh
         run: |
-          $readme = "packaging\README_windows_portable.txt"
-          # tìm thư mục student/supervisor trong dist
-          $studentDir = Get-ChildItem dist -Directory | Where-Object { $_.Name -match 'Student' } | Select-Object -First 1
-          $superDir   = Get-ChildItem dist -Directory | Where-Object { $_.Name -match 'Supervisor' } | Select-Object -First 1
-          if ($studentDir) { Copy-Item $readme "$($studentDir.FullName)\README.txt" -Force }
-          if ($superDir)   { Copy-Item $readme "$($superDir.FullName)\README.txt" -Force }
+          $ErrorActionPreference = 'Stop'
+          if (-not (Test-Path "dist\Paperforge-Student")) { throw "Missing dist\Paperforge-Student" }
+          if (-not (Test-Path "dist\Paperforge-Supervisor")) { throw "Missing dist\Paperforge-Supervisor" }
 
-      # Tạo ZIP portable theo thư mục thực tế trong dist
       - name: Make portable ZIPs
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           $ver = if ("${{ github.ref_name }}") { "${{ github.ref_name }}" } else { "dev" }
-          $studentDir = Get-ChildItem dist -Directory | Where-Object { $_.Name -match 'Student' } | Select-Object -First 1
-          $superDir   = Get-ChildItem dist -Directory | Where-Object { $_.Name -match 'Supervisor' } | Select-Object -First 1
-
-          if (-not $studentDir) { throw "Cannot find Student build folder in dist/" }
-          if (-not $superDir)   { throw "Cannot find Supervisor build folder in dist/" }
-
           $studentZip = "dist\Paperforge-Student-win64-portable-$ver.zip"
           $superZip   = "dist\Paperforge-Supervisor-win64-portable-$ver.zip"
-
           if (Test-Path $studentZip) { Remove-Item $studentZip -Force }
           if (Test-Path $superZip)   { Remove-Item $superZip -Force }
-
-          Compress-Archive -Path "$($studentDir.FullName)\*" -DestinationPath $studentZip -Force
-          Compress-Archive -Path "$($superDir.FullName)\*"   -DestinationPath $superZip   -Force
+          Compress-Archive -Path "dist\Paperforge-Student\*"   -DestinationPath $studentZip -Force
+          Compress-Archive -Path "dist\Paperforge-Supervisor\*" -DestinationPath $superZip -Force
 
       - name: Upload portable artifacts
         uses: actions/upload-artifact@v4

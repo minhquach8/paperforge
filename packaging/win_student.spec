@@ -1,32 +1,65 @@
-# British English comments.
-from PyInstaller.utils.hooks import collect_submodules, collect_data_files
+# -*- mode: python ; coding: utf-8 -*-
+
+# Deterministic, portable onedir build for Student app (Windows).
+# Ensures dist/Paperforge-Student exists for CI zip step.
+
+import os
+from pathlib import Path
+
 block_cipher = None
-
-pyside6_datas  = collect_data_files("PySide6", includes=["**/*"])
-pyside6_hidden = collect_submodules("PySide6")
-
-# Bundle Tectonic into the app; CI will download it into vendor/...
-binaries = [
-    ("vendor/tectonic/windows-x86_64/tectonic.exe", "tectonic/windows-x86_64"),
-]
+project_root = Path(__file__).resolve().parents[1]
 
 a = Analysis(
-    ["apps/student_app/main.py"],
-    pathex=[],
-    binaries=binaries,
-    datas=pyside6_datas,
-    hiddenimports=pyside6_hidden,
+    ['apps/student_app/main.py'],
+    pathex=[str(project_root)],
+    binaries=[],
+    datas=[
+        # Bundle Tectonic runtime
+        ('vendor/tectonic/windows-x86_64/tectonic.exe', 'tectonic/windows-x86_64'),
+        # Optional: static assets for the app (adjust if you add icons etc.)
+        ('assets/*', 'assets'),
+    ],
+    hiddenimports=[
+        'shiboken6',
+        'PySide6',
+        'PySide6.QtCore',
+        'PySide6.QtGui',
+        'PySide6.QtWidgets',
+    ],
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[],
     noarchive=False,
 )
+
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+
 exe = EXE(
-    pyz, a.scripts, [],
+    pyz,
+    a.scripts,
     exclude_binaries=True,
-    name="Paperforge Student",
-    console=False,   # GUI app
-    icon=None,       # add assets/icons/student.ico when available
+    name='Paperforge-Student',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=False,
+    console=False,  # GUI app
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+    icon=None,  # you can add an .ico later
 )
+
 coll = COLLECT(
-    exe, a.binaries, a.zipfiles, a.datas,
-    strip=False, upx=False, name="Paperforge Student"
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    name='Paperforge-Student',
 )
