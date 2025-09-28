@@ -97,10 +97,13 @@ jobs:
           if-no-files-found: error
 
       # đọc version từ shared/version.py
-      - name: Read version
+      - name: Read app version
         id: ver
-        shell: bash
-        run: echo "version=$(python - << 'PY'\nfrom shared.version import APP_VERSION\nprint(APP_VERSION)\nPY\n)" >> $GITHUB_OUTPUT
+        shell: pwsh
+        run: |
+          $v = python -c "from shared.version import APP_VERSION; print(APP_VERSION)"
+          echo "version=$v" >> $env:GITHUB_OUTPUT
+
 
       # tạo GitHub Release & upload assets
       - name: Create GitHub Release
