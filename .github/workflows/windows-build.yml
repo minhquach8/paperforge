@@ -2,11 +2,11 @@ name: Windows build
 
 on:
   push:
-    tags: [ 'v*' ]   # push tag v1.0.0 sẽ kích hoạt luôn
-  workflow_dispatch:
+    tags: ['v*']          # push tag v1.2.3 sẽ chạy
+  workflow_dispatch:      # cho phép chạy tay
 
 permissions:
-  contents: write   # cần để tạo GitHub Release
+  contents: write         # tạo/chỉnh GitHub Release
 
 jobs:
   build-windows:
@@ -14,6 +14,8 @@ jobs:
     defaults:
       run:
         shell: pwsh
+    outputs:
+      app_version: ${{ steps.ver.outputs.version }}
 
     steps:
       - name: Checkout
@@ -30,19 +32,16 @@ jobs:
           pip install -r requirements.txt pyinstaller==6.16.0
 
       - name: Stamp version into env & file
-        shell: pwsh
         run: |
           $ver = "${{ github.ref_name }}"
           if ($env:GITHUB_REF_TYPE -eq "tag") { $ver = $ver.TrimStart('v') } else { $ver = "0.0.0-dev" }
-          "PAPERFORGE_VERSION=$ver"        | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "PAPERFORGE_REPO=minhquach8/paperforge" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          # Tạo file JSON để nhúng vào app
+          "PAPERFORGE_VERSION=$ver"                  | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "PAPERFORGE_REPO=minhquach8/paperforge"    | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           @"
           { "version": "$ver" }
           "@ | Set-Content shared\paperforge_build.json -Encoding utf8
 
       - name: Verify build stamp file exists
-        shell: pwsh
         run: |
           if (-not (Test-Path shared\paperforge_build.json)) {
             Write-Host "Expected file not found: shared\paperforge_build.json"
@@ -50,14 +49,13 @@ jobs:
             throw "paperforge_build.json missing"
           }
 
-      # (TÙY CHỌN) In version từ shared/version.py nếu bạn có file này
-      - name: Read app version
+      - name: Read app version (from shared/version.py if present)
         id: ver
         run: |
           try {
             $v = python -c "from shared.version import APP_VERSION; print(APP_VERSION)"
           } catch {
-            $v = "0.0.0-dev"
+            $v = "$env:PAPERFORGE_VERSION"
           }
           echo "version=$v" >> $env:GITHUB_OUTPUT
 
@@ -72,7 +70,6 @@ jobs:
           Write-Host "== dist =="
           Get-ChildItem -Recurse -Force dist | ForEach-Object { $_.FullName }
 
-      # Đóng gói ZIP, KHÔNG phụ thuộc tên thư mục cố định
       - name: Zip portable bundles
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
@@ -101,15 +98,55 @@ jobs:
             dist/Paperforge-Student-Portable-win64.zip
           if-no-files-found: error
 
-      # Chỉ tạo Release khi workflow chạy do push tag (refs/tags/*)
+  release:
+    needs: build-windows
+    if: startsWith(github.ref, 'refs/tags/') && github.ref_protected == true
+    runs-on: ubuntu-latest
+    environment: production   # sẽ chờ bạn Approve trong Environments
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: paperforge-portable-${{ needs.build-windows.outputs.app_version }}
+          path: dist
+
+      - name: Install minisign
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y minisign
+
+      - name: Restore signing key
+        env:
+          MINISIGN_SECRET_B64: ${{ secrets.MINISIGN_SECRET_B64 }}
+        run: |
+          test -n "$MINISIGN_SECRET_B64" || (echo "MINISIGN_SECRET_B64 missing"; exit 1)
+          echo "$MINISIGN_SECRET_B64" | base64 -d > minisign.key
+          chmod 600 minisign.key
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum Paperforge-*-Portable-win64.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Sign artifacts (minisign)
+        run: |
+          cd dist
+          minisign -S -s ../minisign.key -m Paperforge-Supervisor-Portable-win64.zip -x Paperforge-Supervisor-Portable-win64.zip.minisig -H -c "${{ github.ref_name }} supervisor"
+          minisign -S -s ../minisign.key -m Paperforge-Student-Portable-win64.zip   -x Paperforge-Student-Portable-win64.zip.minisig   -H -c "${{ github.ref_name }} student"
+          minisign -S -s ../minisign.key -m SHA256SUMS.txt                          -x SHA256SUMS.txt.minisig                          -H -c "${{ github.ref_name }} checksums"
+
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}   # v1.0.0
+          tag_name: ${{ github.ref_name }}
           name: Release ${{ github.ref_name }}
           draft: false
           prerelease: false
           files: |
             dist/Paperforge-Supervisor-Portable-win64.zip
+            dist/Paperforge-Supervisor-Portable-win64.zip.minisig
             dist/Paperforge-Student-Portable-win64.zip
+            dist/Paperforge-Student-Portable-win64.zip.minisig
+            dist/SHA256SUMS.txt
+            dist/SHA256SUMS.txt.minisig

@@ -18,6 +18,7 @@ datas = [
     (str(PROJECT_ROOT / "shared" / "paperforge_build.json"), "."),  # <-- đổi dòng này
     (str(PROJECT_ROOT / "vendor" / "tectonic" / "windows-x86_64" / "tectonic.exe"),
      "vendor/tectonic/windows-x86_64"),
+    (str(PROJECT_ROOT / "vendor" / "minisign" / "windows" / "minisign.exe"), "vendor/minisign/windows"),
 ]
 
 
