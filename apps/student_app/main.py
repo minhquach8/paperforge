@@ -35,20 +35,10 @@ from PySide6.QtWidgets import (
 )
 
 # Repo core
-from paperrepo.repo import (
-    commit as repo_commit,
-)
-from paperrepo.repo import (
-    head_commit_id,
-    init_repo,
-    is_repo,
-)
-from paperrepo.repo import (
-    history as repo_history,
-)
-from paperrepo.repo import (
-    restore as repo_restore,
-)
+from paperrepo.repo import commit as repo_commit
+from paperrepo.repo import head_commit_id, init_repo, is_repo
+from paperrepo.repo import history as repo_history
+from paperrepo.repo import restore as repo_restore
 
 # App/shared helpers
 from shared.config import (
@@ -66,7 +56,9 @@ from shared.events import (
 from shared.models import Manifest, ManuscriptType
 from shared.paths import manuscript_root, manuscript_subdirs, slugify
 from shared.timeutil import iso_to_local_str
-from shared.updater import check_for_updates_safely, download_and_stage_update
+
+# ⬇️ Updater portable – tương thích API cũ/lẫn mới
+from shared.updater import cleanup_legacy_appdata_if_any, download_and_stage_update
 from shared.version import APP_VERSION, GITHUB_REPO
 
 APP_NAME = 'Paperforge — Student'
@@ -304,12 +296,10 @@ class StudentWindow(QMainWindow):
 
         self.statusBar().showMessage('Ready', 3000)
 
+        # Dọn cơ chế AppData cũ (nếu từng dùng)
+        cleanup_legacy_appdata_if_any()
         # Auto-check update (silent) sau 3s
         QTimer.singleShot(3000, self._check_updates_silent)
-        QTimer.singleShot(1800, lambda: check_for_updates_safely(
-            "Student",
-            status_cb=lambda msg: self.statusBar().showMessage(msg, 4000),
-        ))
 
     # ──────────────────────────────────────────────────────────────────────
     # Updates (manual & silent)
@@ -323,43 +313,72 @@ class StudentWindow(QMainWindow):
         self._do_check_update(silent=True)
 
     def _do_check_update(self, silent: bool) -> None:
+        """
+        Tương thích:
+          - Updater mới (trả ('up_to_date'|'staged'|'error', detail))
+          - Updater cũ (trả path exe mới dạng str)
+        """
         try:
             if not silent:
                 self.statusBar().showMessage('Checking updates…', 3000)
 
-            # Identify đúng asset Student trong Releases
-            app_keyword = "Student"
-            app_id = "student"
+            res = None
+            try:
+                # API cũ: cần GITHUB_REPO + app_keyword + version
+                res = download_and_stage_update(GITHUB_REPO, "Student", APP_VERSION, app_id="student")
+            except TypeError:
+                # API mới: chỉ truyền app_id
+                res = download_and_stage_update("student")
 
-            new_path = download_and_stage_update(GITHUB_REPO, app_keyword, APP_VERSION, app_id=app_id)
-            if not new_path:
+            # ── Xử lý kết quả
+            if isinstance(res, tuple):
+                status, detail = res
+                if status == "up_to_date":
+                    if not silent:
+                        QMessageBox.information(self, "Updates", f"You're on the latest version (v{APP_VERSION}).")
+                    else:
+                        self.statusBar().showMessage("Up-to-date.", 3000)
+                    return
+                if status == "staged":
+                    QMessageBox.information(self, "Update", "Update has been staged. The app will restart.")
+                    QApplication.quit()
+                    return
+                # error
                 if not silent:
-                    QMessageBox.information(self, "Updates", f"You're on the latest version (v{APP_VERSION}).")
+                    QMessageBox.warning(self, "Update", f"Update check failed: {detail}")
+                else:
+                    self.statusBar().showMessage(f"Update check failed: {detail}", 5000)
                 return
 
-            # Có bản mới
-            if sys.platform.startswith("win"):
-                ans = QMessageBox.question(
-                    self, "Update ready",
-                    f"A new version has been downloaded.\n\nLaunch the updated app now?\n\n{new_path}",
-                    QMessageBox.Yes | QMessageBox.No
-                )
-                if ans == QMessageBox.Yes:
-                    try:
-                        subprocess.Popen([str(new_path)], close_fds=True)
-                    finally:
-                        QApplication.quit()
+            # API cũ: res là path exe mới hoặc None
+            if isinstance(res, (str, Path)) and res:
+                new_path = Path(res)
+                if sys.platform.startswith("win"):
+                    ans = QMessageBox.question(
+                        self, "Update ready",
+                        f"A new version has been downloaded.\n\nLaunch the updated app now?\n\n{new_path}",
+                        QMessageBox.Yes | QMessageBox.No
+                    )
+                    if ans == QMessageBox.Yes:
+                        try:
+                            subprocess.Popen([str(new_path)], close_fds=True)
+                        finally:
+                            QApplication.quit()
+                    else:
+                        open_with_default_app(new_path.parent)
                 else:
-                    open_with_default_app(Path(new_path).parent)
-            elif sys.platform == "darwin":
-                QMessageBox.information(
-                    self, "Update downloaded",
-                    "An update has been downloaded.\nPlease open the folder and move the new app into Applications."
-                )
-                open_with_default_app(Path(new_path).parent)
-            else:
-                QMessageBox.information(self, "Update downloaded", f"Downloaded to: {new_path}")
+                    QMessageBox.information(self, "Update downloaded", f"Downloaded to: {new_path}")
+                    open_with_default_app(new_path.parent)
+                return
 
+            # Không có update
+            if not silent:
+                QMessageBox.information(self, "Updates", f"You're on the latest version (v{APP_VERSION}).")
+            else:
+                self.statusBar().showMessage("Up-to-date.", 3000)
+
+        except SystemExit:
+            raise
         except Exception as e:
             if silent:
                 self.statusBar().showMessage(f'Update check failed: {e}', 5000)

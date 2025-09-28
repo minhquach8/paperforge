@@ -5,7 +5,6 @@ import json
 import shutil
 import subprocess
 import sys
-import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -42,20 +41,20 @@ from shared.events import get_submission_times, returned_event, write_event
 from shared.latex.builder import build_pdf, detect_main_tex
 from shared.latex.diff import build_diff_pdf
 from shared.timeutil import iso_to_local_str
-from shared.updater import check_for_updates_safely, download_and_stage_update
-from shared.version import APP_VERSION, GITHUB_REPO
+
+# ⬇️ Updater (portable) – tương thích cả API cũ/lẫn mới
+from shared.updater import cleanup_legacy_appdata_if_any, download_and_stage_update
+from shared.version import APP_VERSION
 
 APP_NAME = 'Paperforge — Supervisor'
 RECENTS_KEY = 'supervisor_recent_roots'
 MAX_RECENTS = 5
 
-# Soft, readable colours (work well on macOS/Windows light themes)
 STATUS_COLOURS = {
     'New': ('#E8F0FE', '#0B57D0'),
     'In review': ('#FFF8E1', '#8C6D1F'),
     'Returned': ('#E6F4EA', '#0F6D31'),
 }
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Utilities
@@ -239,7 +238,7 @@ class SupervisorWindow(QMainWindow):
         central = QWidget(self)
         root = QVBoxLayout(central)
 
-        # Toolbar (replaces old Choose/Scan buttons)
+        # Toolbar
         tb = QToolBar('Quick actions', self)
         tb.setIconSize(QSize(18, 18))
         tb.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
@@ -261,18 +260,11 @@ class SupervisorWindow(QMainWindow):
         _act(QStyle.SP_DialogResetButton, 'Clear filters', self._clear_filters)
         tb.addSeparator()
         self.act_autorescan = _act(
-            QStyle.SP_BrowserReload,
-            'Auto-rescan',
-            self._toggle_autorescan,
-            checkable=True,
+            QStyle.SP_BrowserReload, 'Auto-rescan', self._toggle_autorescan, checkable=True
         )
         tb.addSeparator()
-        # NEW: Check for updates
         self.act_check_update = _act(
-            QStyle.SP_BrowserReload,
-            f'Check for updates… (v{APP_VERSION})',
-            self._check_updates,
-            checkable=False,
+            QStyle.SP_BrowserReload, f'Check for updates… (v{APP_VERSION})', self._check_updates
         )
 
         # Current root label
@@ -300,9 +292,7 @@ class SupervisorWindow(QMainWindow):
         filters = QHBoxLayout()
         filters.addWidget(QLabel('Search:'))
         self.ed_search = QLineEdit(self)
-        self.ed_search.setPlaceholderText(
-            'Student / Manuscript / Journal / Submission ID'
-        )
+        self.ed_search.setPlaceholderText('Student / Manuscript / Journal / Submission ID')
         self.ed_search.setClearButtonEnabled(True)
         self.ed_search.textChanged.connect(self.scan_root)
         filters.addWidget(self.ed_search, stretch=1)
@@ -334,18 +324,9 @@ class SupervisorWindow(QMainWindow):
         # Tree
         self.tree = QTreeWidget(self)
         self.tree.setColumnCount(8)
-        self.tree.setHeaderLabels(
-            [
-                'Student',
-                'Manuscript',
-                'Journal',
-                'Submission',
-                'Type',
-                'Status',
-                'When',
-                'Last Edit',
-            ]
-        )
+        self.tree.setHeaderLabels([
+            'Student', 'Manuscript', 'Journal', 'Submission', 'Type', 'Status', 'When', 'Last Edit',
+        ])
         self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.tree.setUniformRowHeights(True)
         self.tree.itemDoubleClicked.connect(self._open_item)
@@ -372,7 +353,7 @@ class SupervisorWindow(QMainWindow):
         self.students_root: Optional[Path] = None
         self._update_recent_ui()
 
-        # Auto-use most recent if available
+        # Auto-use most recent
         recents = self._load_recent_roots()
         if recents and Path(recents[0]).exists():
             self._set_students_root(Path(recents[0]), remember=False, autoscan=True)
@@ -397,69 +378,94 @@ class SupervisorWindow(QMainWindow):
         self.setCentralWidget(central)
         self.statusBar().showMessage('Ready', 3000)
 
-        # Auto-check update (silent) ~3s sau khi mở app
+        # Dọn cơ chế cũ nếu từng xài AppData
+        cleanup_legacy_appdata_if_any()
+        # Silent update check sau 3s
         QTimer.singleShot(3000, self._check_updates_silent)
-        QTimer.singleShot(1500, lambda: check_for_updates_safely(
-            "Supervisor",
-            status_cb=lambda msg: self.statusBar().showMessage(msg, 4000),
-            on_update_url=lambda url: __import__("webbrowser").open(url),
-        ))
 
     # ──────────────────────────────────────────────────────────────────────
     # Updates (manual & silent)
     # ──────────────────────────────────────────────────────────────────────
     def _check_updates(self) -> None:
-        """Manual check – luôn hiển thị thông báo."""
         self._do_check_update(silent=False)
 
     def _check_updates_silent(self) -> None:
-        """Silent check – chỉ báo khi có bản mới."""
         self._do_check_update(silent=True)
 
     def _do_check_update(self, silent: bool) -> None:
+        """
+        Tương thích:
+          - Updater mới (trả ('up_to_date'|'staged'|'error', detail))
+          - Updater cũ (trả path exe mới dạng str)
+        """
         try:
             if not silent:
                 self.statusBar().showMessage('Checking updates…', 3000)
 
-            # app_keyword giúp chọn đúng asset theo tên file trên Release
-            app_keyword = "Supervisor"
-            app_id = "supervisor"
+            # Thử gọi theo API cũ trước (4 tham số). Nếu TypeError ⇒ API mới.
+            res = None
+            try:
+                # API cũ: trả path exe mới (hoặc None)
+                from shared.version import GITHUB_REPO  # chỉ cần khi API cũ
+                res = download_and_stage_update(GITHUB_REPO, "Supervisor", APP_VERSION, app_id="supervisor")
+            except TypeError:
+                # API mới: trả tuple(status, detail)
+                res = download_and_stage_update("supervisor")
 
-            new_path = download_and_stage_update(GITHUB_REPO, app_keyword, APP_VERSION, app_id=app_id)
-            if not new_path:
+            # ── Xử lý kết quả
+            if isinstance(res, tuple):
+                status, detail = res
+                if status == "up_to_date":
+                    if not silent:
+                        QMessageBox.information(self, "Updates", f"You're on the latest version (v{APP_VERSION}).")
+                    else:
+                        self.statusBar().showMessage("Up-to-date.", 3000)
+                    return
+                if status == "staged":
+                    # Với updater mới, quá trình đã sinh batch & sẽ thoát app.
+                    # Nếu chưa thoát (tuỳ implementation), thì thoát để batch chạy.
+                    QMessageBox.information(self, "Update", "Update has been staged. The app will restart.")
+                    QApplication.quit()
+                    return
+                # error
                 if not silent:
-                    QMessageBox.information(self, "Updates", f"You're on the latest version (v{APP_VERSION}).")
+                    QMessageBox.warning(self, "Update", f"Update check failed: {detail}")
+                else:
+                    self.statusBar().showMessage(f"Update check failed: {detail}", 5000)
                 return
 
-            # Có bản mới đã tải xong
-            if sys.platform.startswith("win"):
-                ans = QMessageBox.question(
-                    self, "Update ready",
-                    f"A new version has been downloaded.\n\nLaunch the updated app now?\n\n{new_path}",
-                    QMessageBox.Yes | QMessageBox.No
-                )
-                if ans == QMessageBox.Yes:
-                    try:
-                        subprocess.Popen([str(new_path)], close_fds=True)
-                    finally:
-                        QApplication.quit()
+            # API cũ: res là path exe mới hoặc None
+            if isinstance(res, (str, Path)) and res:
+                new_path = Path(res)
+                if sys.platform.startswith("win"):
+                    ans = QMessageBox.question(
+                        self, "Update ready",
+                        f"A new version has been downloaded.\n\nLaunch the updated app now?\n\n{new_path}",
+                        QMessageBox.Yes | QMessageBox.No
+                    )
+                    if ans == QMessageBox.Yes:
+                        try:
+                            subprocess.Popen([str(new_path)], close_fds=True)
+                        finally:
+                            QApplication.quit()
+                    else:
+                        open_with_default_app(new_path.parent)
                 else:
-                    # Mở thư mục để người dùng tự chạy sau
-                    open_with_default_app(Path(new_path).parent)
-            elif sys.platform == "darwin":
-                # MVP cho macOS: mở thư mục chứa gói tải về (zip/dmg) để kéo vào Applications
-                QMessageBox.information(
-                    self, "Update downloaded",
-                    "An update has been downloaded.\n"
-                    "Please open the folder and move the new app into Applications."
-                )
-                open_with_default_app(Path(new_path).parent)
-            else:
-                QMessageBox.information(self, "Update downloaded", f"Downloaded to: {new_path}")
+                    QMessageBox.information(self, "Update downloaded", f"Downloaded to: {new_path}")
+                    open_with_default_app(new_path.parent)
+                return
 
+            # Không có update
+            if not silent:
+                QMessageBox.information(self, "Updates", f"You're on the latest version (v{APP_VERSION}).")
+            else:
+                self.statusBar().showMessage("Up-to-date.", 3000)
+
+        except SystemExit:
+            # Updater mới có thể tự sys.exit(0) sau khi stage; cứ để thoát.
+            raise
         except Exception as e:
             if silent:
-                # im lặng: chỉ log nhẹ nhàng ở status bar để khỏi làm phiền
                 self.statusBar().showMessage(f'Update check failed: {e}', 5000)
             else:
                 QMessageBox.warning(self, "Update failed", str(e))
@@ -471,9 +477,7 @@ class SupervisorWindow(QMainWindow):
         txt = str(self.students_root) if self.students_root else '(none)'
         self.lbl_root.setText(f'Students’ Root: {txt}')
 
-    def _set_students_root(
-        self, path: Path, *, remember: bool = True, autoscan: bool = True
-    ) -> None:
+    def _set_students_root(self, path: Path, *, remember: bool = True, autoscan: bool = True) -> None:
         self.students_root = path
         self._update_root_label()
         if remember:
@@ -494,14 +498,11 @@ class SupervisorWindow(QMainWindow):
             if r in seen:
                 continue
             if Path(r).exists():
-                out.append(r)
-                seen.add(r)
+                out.append(r); seen.add(r)
         return out
 
     def _save_recent_roots(self, roots: list[str]) -> None:
-        cfg = load_config()
-        cfg[RECENTS_KEY] = roots[:MAX_RECENTS]
-        save_config(cfg)
+        cfg = load_config(); cfg[RECENTS_KEY] = roots[:MAX_RECENTS]; save_config(cfg)
 
     def _remember_root(self, path: Path) -> None:
         s = str(path)
@@ -543,32 +544,14 @@ class SupervisorWindow(QMainWindow):
     # Root selection & scanning
     # ──────────────────────────────────────────────────────────────────────
     def choose_root(self) -> None:
-        folder = QFileDialog.getExistingDirectory(
-            self, 'Select Students’ Root (OneDrive)'
-        )
+        folder = QFileDialog.getExistingDirectory(self, 'Select Students’ Root (OneDrive)')
         if folder:
             self._set_students_root(Path(folder), remember=True, autoscan=True)
 
-    def _row_passes_filters(
-        self,
-        student: str,
-        title: str,
-        journal: str,
-        sub_id: str,
-        mtype: str,
-        status: str,
-    ) -> bool:
+    def _row_passes_filters(self, student: str, title: str, journal: str, sub_id: str, mtype: str, status: str) -> bool:
         q = self.ed_search.text().strip().lower()
         if q:
-            if all(
-                q not in s
-                for s in (
-                    student.lower(),
-                    title.lower(),
-                    (journal or '').lower(),
-                    sub_id.lower(),
-                )
-            ):
+            if all(q not in s for s in (student.lower(), title.lower(), (journal or '').lower(), sub_id.lower())):
                 return False
         ty = self.cb_type.currentText()
         if ty == 'Word' and mtype != 'docx':
@@ -615,7 +598,6 @@ class SupervisorWindow(QMainWindow):
 
                     payload = subdir / 'payload'
 
-                    # Title, type, journal
                     title = title_default
                     mtype = 'unknown'
                     journal = ''
@@ -628,9 +610,7 @@ class SupervisorWindow(QMainWindow):
                         pass
                     if not journal:
                         try:
-                            py = json.loads(
-                                (payload / 'paper.yaml').read_text(encoding='utf-8')
-                            )
+                            py = json.loads((payload / 'paper.yaml').read_text(encoding='utf-8'))
                             journal = (py.get('journal') or '').strip()
                         except Exception:
                             journal = ''
@@ -657,28 +637,13 @@ class SupervisorWindow(QMainWindow):
                     last_edit_iso = last_review_edit_iso(manuscript_dir, subdir.name)
                     last_edit_label = iso_to_local_str(last_edit_iso)
 
-                    if not self._row_passes_filters(
-                        student_dir.name, title, journal, subdir.name, mtype, status
-                    ):
+                    if not self._row_passes_filters(student_dir.name, title, journal, subdir.name, mtype, status):
                         continue
 
-                    type_label = (
-                        'Word'
-                        if mtype == 'docx'
-                        else ('LaTeX' if mtype == 'latex' else mtype)
-                    )
-                    row = QTreeWidgetItem(
-                        [
-                            student_dir.name,
-                            title,
-                            journal,
-                            subdir.name,
-                            type_label,
-                            status,
-                            when_label,
-                            last_edit_label,
-                        ]
-                    )
+                    type_label = 'Word' if mtype == 'docx' else ('LaTeX' if mtype == 'latex' else mtype)
+                    row = QTreeWidgetItem([
+                        student_dir.name, title, journal, subdir.name, type_label, status, when_label, last_edit_label,
+                    ])
                     self._apply_status_style(row, status)
                     row.setData(0, Qt.UserRole, str(subdir))
 
@@ -708,9 +673,7 @@ class SupervisorWindow(QMainWindow):
         for col in (0, 1, 2, 4, 5, 7):
             self.tree.resizeColumnToContents(col)
 
-        self.statusBar().showMessage(
-            f'Found {total} submission(s) after filters.', 5000
-        )
+        self.statusBar().showMessage(f'Found {total} submission(s) after filters.', 5000)
 
     # ──────────────────────────────────────────────────────────────────────
     # Item helpers
@@ -742,9 +705,7 @@ class SupervisorWindow(QMainWindow):
     def _open_path(self, subdir: Path) -> None:
         manifest_path = subdir / 'manifest.json'
         if not manifest_path.exists():
-            QMessageBox.warning(
-                self, 'Missing manifest', 'This submission has no manifest.json.'
-            )
+            QMessageBox.warning(self, 'Missing manifest', 'This submission has no manifest.json.')
             return
 
         payload = subdir / 'payload'
@@ -757,11 +718,7 @@ class SupervisorWindow(QMainWindow):
         if mtype == 'docx':
             primary = self._find_primary_word(payload)
             if not primary:
-                QMessageBox.warning(
-                    self,
-                    'No Word file',
-                    'No .docx or .doc file was found in this submission.',
-                )
+                QMessageBox.warning(self, 'No Word file', 'No .docx or .doc file was found in this submission.')
                 return
             working = reviews_dir / f'working{primary.suffix.lower()}'
             shutil.copy2(primary, working)
@@ -791,8 +748,7 @@ class SupervisorWindow(QMainWindow):
         for col in range(self.tree.columnCount()):
             item.setBackground(col, bg)
             item.setForeground(col, fg)
-        f = QFont(self.font())
-        f.setBold(True)
+        f = QFont(self.font()); f.setBold(True)
         item.setFont(5, f)
 
     # ──────────────────────────────────────────────────────────────────────
@@ -803,9 +759,7 @@ class SupervisorWindow(QMainWindow):
         if not dirs:
             return
         if len(dirs) > 1:
-            QMessageBox.information(
-                self, 'Notes', 'Please select a single submission to edit notes.'
-            )
+            QMessageBox.information(self, 'Notes', 'Please select a single submission to edit notes.')
             return
 
         subdir = dirs[0]
@@ -822,17 +776,13 @@ class SupervisorWindow(QMainWindow):
 
         data = load_comments_json(reviews_dir)
         from PySide6.QtWidgets import QDialog, QDialogButtonBox, QTextEdit, QVBoxLayout
-
         d = QDialog(self)
         d.setWindowTitle('Review notes')
         lay = QVBoxLayout(d)
-        ed = QTextEdit(d)
-        ed.setPlainText(data.get('general', ''))
+        ed = QTextEdit(d); ed.setPlainText(data.get('general', ''))
         lay.addWidget(QLabel('General notes:'))
         lay.addWidget(ed)
-        btns = QDialogButtonBox(
-            QDialogButtonBox.Save | QDialogButtonBox.Cancel, parent=d
-        )
+        btns = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel, parent=d)
         lay.addWidget(btns)
 
         def _save():
@@ -848,9 +798,7 @@ class SupervisorWindow(QMainWindow):
     def _return_selected_batch(self) -> None:
         dirs = self._selected_submission_dirs()
         if not dirs:
-            QMessageBox.information(
-                self, 'Return', 'Please select one or more submissions.'
-            )
+            QMessageBox.information(self, 'Return', 'Please select one or more submissions.')
             return
 
         successes = 0
@@ -867,15 +815,9 @@ class SupervisorWindow(QMainWindow):
 
         self.scan_root()
         if failures:
-            QMessageBox.warning(
-                self,
-                'Return completed with issues',
-                f'Returned {successes} submission(s).\nFailed: {", ".join(failures)}',
-            )
+            QMessageBox.warning(self, 'Return completed with issues', f'Returned {successes} submission(s).\nFailed: {", ".join(failures)}')
         else:
-            QMessageBox.information(
-                self, 'Returned', f'Returned {successes} submission(s).'
-            )
+            QMessageBox.information(self, 'Returned', f'Returned {successes} submission(s).')
 
     def _return_one(self, subdir: Path) -> bool:
         manuscript_root = subdir.parent.parent
@@ -891,9 +833,7 @@ class SupervisorWindow(QMainWindow):
             returned = reviews_dir / f'returned{working.suffix.lower()}'
             shutil.copy2(working, returned)
             if not (reviews_dir / 'comments.json').exists():
-                save_comments_json(
-                    reviews_dir, {'general': 'Reviewed in Word', 'items': []}
-                )
+                save_comments_json(reviews_dir, {'general': 'Reviewed in Word', 'items': []})
             write_event(events_dir, returned_event(subdir.name))
             return True
 
@@ -901,22 +841,16 @@ class SupervisorWindow(QMainWindow):
         for ext in ('.docx', '.doc'):
             ps = sorted(payload.rglob(f'*{ext}'))
             if ps:
-                primary_word = ps[0]
-                break
+                primary_word = ps[0]; break
         if primary_word is not None:
             returned = reviews_dir / f'returned{primary_word.suffix.lower()}'
             shutil.copy2(primary_word, returned)
             if not (reviews_dir / 'comments.json').exists():
-                save_comments_json(
-                    reviews_dir,
-                    {'general': 'Reviewed in Word (from submitted file)', 'items': []},
-                )
+                save_comments_json(reviews_dir, {'general': 'Reviewed in Word (from submitted file)', 'items': []})
             write_event(events_dir, returned_event(subdir.name))
             return True
 
-        worktree = (
-            reviews_dir / 'worktree' if (reviews_dir / 'worktree').exists() else payload
-        )
+        worktree = reviews_dir / 'worktree' if (reviews_dir / 'worktree').exists() else payload
         diff_ok, diff_log, diff_pdf = build_diff_pdf(payload, worktree, reviews_dir)
         pdf_path = diff_pdf
         if not diff_ok or not (pdf_path and pdf_path.exists()):
@@ -930,9 +864,7 @@ class SupervisorWindow(QMainWindow):
         returned_html = reviews_dir / 'returned.html'
         title = manuscript_root.name
         try:
-            manifest = json.loads(
-                (subdir / 'manifest.json').read_text(encoding='utf-8')
-            )
+            manifest = json.loads((subdir / 'manifest.json').read_text(encoding='utf-8'))
             title = manifest.get('manuscript_title', title)
         except Exception:
             pass

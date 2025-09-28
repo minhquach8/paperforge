@@ -2,7 +2,6 @@ name: Windows build
 
 on:
   push:
-    branches: [ main ]
     tags: [ 'v*' ]   # push tag v1.0.0 sẽ kích hoạt luôn
   workflow_dispatch:
 
