@@ -41,6 +41,14 @@ jobs:
           { "version": "$ver" }
           "@ | Set-Content shared\paperforge_build.json -Encoding utf8
 
+      - name: Verify build stamp file exists
+        shell: pwsh
+        run: |
+          if (-not (Test-Path shared\paperforge_build.json)) {
+            Write-Host "Expected file not found: shared\paperforge_build.json"
+            Get-ChildItem -Recurse shared | ForEach-Object { $_.FullName }
+            throw "paperforge_build.json missing"
+          }
 
       # (TÙY CHỌN) In version từ shared/version.py nếu bạn có file này
       - name: Read app version

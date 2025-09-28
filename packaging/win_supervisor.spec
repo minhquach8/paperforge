@@ -12,12 +12,14 @@ block_cipher = None
 
 app_entry = str(PROJECT_ROOT / "apps" / "supervisor_app" / "main.py")
 
+
 datas = [
     (str(PROJECT_ROOT / "assets"), "assets"),
+    (str(PROJECT_ROOT / "shared" / "paperforge_build.json"), "."),  # <-- đổi dòng này
     (str(PROJECT_ROOT / "vendor" / "tectonic" / "windows-x86_64" / "tectonic.exe"),
      "vendor/tectonic/windows-x86_64"),
-     ('shared/paperforge_build.json', '.') ,
 ]
+
 
 binaries = []
 hiddenimports = [
