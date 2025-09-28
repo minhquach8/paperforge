@@ -11,7 +11,7 @@ from pathlib import Path
 from time import time
 from typing import Optional
 
-from PySide6.QtCore import QSettings, QSize, Qt, QTimer
+from PySide6.QtCore import QSettings, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QIcon, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QSplitter,
     QStyle,
@@ -103,6 +104,45 @@ def detect_manuscript_type(root: Path) -> ManuscriptType:
     if has_word and has_tex:
         return ManuscriptType.DOCX  # prefer Word for MVP
     return ManuscriptType.DOCX
+
+
+class UpdateWorker(QThread):
+    done = Signal(object)       # path exe/installer mới (Path hoặc str)
+    up_to_date = Signal()
+    error = Signal(str)
+
+    def run(self):
+        from shared.updater import download_and_stage_update
+        from shared.version import APP_VERSION, GITHUB_REPO
+        try:
+            try:
+                # API cũ: (repo, keyword, version, app_id) -> path or None
+                res = download_and_stage_update(GITHUB_REPO, "Student", APP_VERSION, app_id="student")
+            except TypeError:
+                # API mới: (app_id) -> (status, detail)
+                res = download_and_stage_update("student")
+
+            if isinstance(res, tuple):
+                status, detail = res
+                if status == "up_to_date":
+                    self.up_to_date.emit(); return
+                if status == "staged":
+                    # detail: path tải xong
+                    self.done.emit(detail); return
+                self.error.emit(str(detail)); return
+
+            # API cũ
+            if isinstance(res, (str, Path)) and res:
+                self.done.emit(res); return
+
+            self.up_to_date.emit()
+
+        except Exception as e:
+            msg = str(e)
+            if "404" in msg or "Not Found" in msg:
+                self.up_to_date.emit()
+            else:
+                self.error.emit(msg)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -392,71 +432,52 @@ exit
             QMessageBox.warning(self, "Update", f"Failed to apply update:\n{e}")
 
     def _check_updates(self) -> None:
-        """
-        Chỉ chạy khi người dùng bấm nút.
-        - Hỏi xác nhận trước khi làm gì.
-        - Nếu có bản mới và tải xong → cập nhật in-place (Windows) hoặc mở thư mục chứa file mới.
-        - Nếu không có gì → báo Up-to-date (bắt 404 như Up-to-date).
-        """
         ans = QMessageBox.question(
-            self,
-            "Check for updates",
+            self, "Check for updates",
             "Check online for a new version now?",
             QMessageBox.Yes | QMessageBox.No,
         )
         if ans != QMessageBox.Yes:
             return
 
-        try:
-            # Ưu tiên API cũ (4 tham số). Nếu TypeError ⇒ API mới.
-            res = None
+        # Progress dialog (indeterminate)
+        dlg = QProgressDialog("Checking & downloading update…", None, 0, 0, self)
+        dlg.setWindowModality(Qt.ApplicationModal)
+        dlg.setCancelButton(None)
+        dlg.setWindowTitle("Updates")
+        dlg.show()
+        self._update_dlg = dlg  # giữ tham chiếu tránh GC
+
+        # Start worker
+        w = UpdateWorker(self)
+        self._update_worker = w  # giữ tham chiếu tránh GC
+
+        def _cleanup():
+            if hasattr(self, "_update_dlg") and self._update_dlg is not None:
+                self._update_dlg.close()
+                self._update_dlg = None
+            self._update_worker = None
+
+        def _ok(path_like):
+            _cleanup()
             try:
-                res = download_and_stage_update(
-                    GITHUB_REPO, "Student", APP_VERSION, app_id="student"
-                )
-            except TypeError:
-                res = download_and_stage_update("student")
+                self._apply_inplace_update(Path(str(path_like)))
+            except Exception as ex:
+                QMessageBox.warning(self, "Update", f"Failed to apply update:\n{ex}")
 
-            # API mới: tuple(status, detail)
-            if isinstance(res, tuple):
-                status, detail = res
-                if status == "up_to_date":
-                    QMessageBox.information(
-                        self, "Updates", f"You're on the latest version (v{APP_VERSION})."
-                    )
-                    return
-                if status == "staged":
-                    try:
-                        p = Path(detail)
-                        if p.exists():
-                            self._apply_inplace_update(p)
-                            return
-                    except Exception:
-                        pass
-                    QMessageBox.information(self, "Update", "Update has been staged.")
-                    return
-                # error / no_release
-                QMessageBox.information(self, "Updates", "Up-to-date or no release available.")
-                return
+        def _uptodate():
+            _cleanup()
+            QMessageBox.information(self, "Updates", f"You're on the latest version (v{APP_VERSION}).")
 
-            # API cũ: res là path exe mới hoặc None
-            if isinstance(res, (str, Path)) and res:
-                self._apply_inplace_update(Path(res))
-                return
+        def _err(msg):
+            _cleanup()
+            QMessageBox.warning(self, "Update failed", msg)
 
-            # Không có update
-            QMessageBox.information(
-                self, "Updates", f"You're on the latest version (v{APP_VERSION})."
-            )
+        w.done.connect(_ok)
+        w.up_to_date.connect(_uptodate)
+        w.error.connect(_err)
+        w.start()
 
-        except SystemExit:
-            raise
-        except Exception as e:
-            msg = str(e)
-            if "404" in msg or "Not Found" in msg:
-                QMessageBox.information(self, "Updates", "Up-to-date (no releases found).")
-            else:
-                QMessageBox.warning(self, "Update failed", msg)
 
     # ──────────────────────────────────────────────────────────────────────
     # Small helpers

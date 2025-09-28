@@ -29,6 +29,29 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller==6.16.0
 
+      - name: Stamp version (from tag) into env and file
+        shell: pwsh
+        run: |
+          $ver = "${{ github.ref_name }}"
+          if ($env:GITHUB_REF_TYPE -eq "tag") {
+            $ver = $ver.TrimStart('v')  # v1.0.3 -> 1.0.3
+          } else {
+            # build từ nhánh -> ghi mốc dev (tùy bạn)
+            $ver = "0.0.0-dev"
+          }
+          # Set env cho PyInstaller (shared/version.py sẽ đọc env này)
+          echo "PAPERFORGE_VERSION=$ver" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "PAPERFORGE_REPO=minhquach8/paperforge" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          # (Optional) Nếu bạn muốn sửa dòng trong file ngay trong workspace build:
+          (Get-Content shared/version.py -Raw) `
+            -replace 'APP_VERSION\s*=\s*".*"', "APP_VERSION = `"$ver`"" `
+            -replace 'GITHUB_REPO\s*=\s*".*"', 'GITHUB_REPO = "minhquach8/paperforge"' |
+            Set-Content shared/version.py -Encoding utf8
+
+          # Xuất output dùng ở các step sau (nếu cần)
+          "version=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
       # (TÙY CHỌN) In version từ shared/version.py nếu bạn có file này
       - name: Read app version
         id: ver
