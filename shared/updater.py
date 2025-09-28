@@ -1,158 +1,118 @@
 # shared/updater.py
 from __future__ import annotations
 
-import io
 import json
 import os
 import sys
-import tempfile
-import zipfile
+import webbrowser
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-USER_AGENT = "PaperforgeUpdater/1.0 (+https://github.com)"
+from shared.version import APP_VERSION, GITHUB_REPO
 
-
-@dataclass
-class ReleaseAsset:
-    name: str
-    download_url: str
-    size: int
-
+USER_AGENT = "Paperforge-Updater/1"
 
 @dataclass
 class ReleaseInfo:
     tag: str
-    notes: str
-    assets: list[ReleaseAsset]
+    html_url: str
+    assets: list[dict]
 
+def _http_get_json(url: str, token: Optional[str]) -> tuple[Optional[dict], Optional[str]]:
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/vnd.github+json",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        with urlopen(Request(url, headers=headers), timeout=15) as r:
+            return json.loads(r.read().decode("utf-8")), None
+    except HTTPError as e:
+        # BẮT 404: coi như không có update, đừng hiện lỗi
+        if e.code == 404:
+            return None, "404"
+        return None, f"http_{e.code}"
+    except URLError:
+        return None, "net"
+    except Exception:
+        return None, "err"
 
-def _version_tuple(v: str) -> Tuple[int, ...]:
+def _parse_repo(spec: str) -> tuple[str, str]:
+    parts = spec.strip().split("/")
+    if len(parts) != 2:
+        raise ValueError("GITHUB_REPO must be '<owner>/<repo>'")
+    return parts[0], parts[1]
+
+def _norm(v: str) -> tuple[int, ...]:
     v = v.strip().lstrip("vV")
-    parts = []
-    for p in v.replace("-", ".").split("."):
-        try:
-            parts.append(int(p))
-        except ValueError:
-            break
-    return tuple(parts) or (0,)
+    out = []
+    for seg in v.split("."):
+        try: out.append(int(seg))
+        except: out.append(0)
+    return tuple(out) or (0,)
 
+def _platform_tag() -> str:
+    if sys.platform.startswith("win"): return "win"
+    if sys.platform == "darwin": return "mac"
+    return "other"
 
-def _http_json(url: str, token: Optional[str] = None) -> dict:
-    req = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/vnd.github+json"})
-    if token:
-        req.add_header("Authorization", f"Bearer {token}")
-    with urlopen(req, timeout=30) as r:
-        return json.loads(r.read().decode("utf-8"))
+def _pick_asset(assets: list[dict], app_kind: str) -> Optional[dict]:
+    name_like = app_kind.lower()      # 'student' / 'supervisor'
+    plat = _platform_tag()
+    def score(a: dict) -> int:
+        n = (a.get("name") or "").lower()
+        s = 0
+        if name_like in n: s += 10
+        if "portable" in n: s += 5
+        if plat == "win" and ("win" in n or "windows" in n): s += 3
+        if plat == "mac" and ("mac" in n or "darwin" in n): s += 3
+        if n.endswith(".zip"): s += 1
+        return s
+    assets_sorted = sorted(assets, key=score, reverse=True)
+    return assets_sorted[0] if assets_sorted and score(assets_sorted[0]) > 0 else None
 
+def fetch_latest_release() -> tuple[Optional[ReleaseInfo], Optional[str]]:
+    owner, repo = _parse_repo(GITHUB_REPO)
+    token = os.getenv("PAPERFORGE_GH_TOKEN") or None
+    url = f"https://api.github.com/repos/{owner}/{repo}/releases/latest"
+    data, err = _http_get_json(url, token)
+    if err == "404":
+        return None, None  # im lặng: chưa có release
+    if err or not data:
+        return None, err or "empty"
+    return ReleaseInfo(
+        tag=(data.get("tag_name") or "").strip(),
+        html_url=(data.get("html_url") or "").strip(),
+        assets=data.get("assets") or [],
+    ), None
 
-def _download(url: str, dest: Path, token: Optional[str] = None) -> None:
-    req = Request(url, headers={"User-Agent": USER_AGENT})
-    if token:
-        req.add_header("Authorization", f"Bearer {token}")
-    with urlopen(req, timeout=120) as r, open(dest, "wb") as f:
-        while True:
-            chunk = r.read(1024 * 256)
-            if not chunk:
-                break
-            f.write(chunk)
+def check_update_info(app_kind: str) -> tuple[bool, Optional[str], Optional[str]]:
+    """
+    -> (has_update, latest_version, download_or_release_url)
+    """
+    rel, _ = fetch_latest_release()
+    if not rel or not rel.tag:
+        return (False, None, None)
+    if _norm(rel.tag) <= _norm(APP_VERSION):
+        return (False, rel.tag, None)
+    asset = _pick_asset(rel.assets, app_kind)
+    if asset and asset.get("browser_download_url"):
+        return (True, rel.tag, asset["browser_download_url"])
+    return (True, rel.tag, rel.html_url or None)
 
-
-def get_latest_release(repo: str, token: Optional[str] = None) -> ReleaseInfo:
-    api = f"https://api.github.com/repos/{repo}/releases/latest"
-    data = _http_json(api, token=token)
-    assets = [
-        ReleaseAsset(
-            name=a.get("name", ""),
-            download_url=a.get("browser_download_url", ""),
-            size=a.get("size", 0),
-        )
-        for a in (data.get("assets") or [])
-    ]
-    return ReleaseInfo(tag=data.get("tag_name", ""), notes=data.get("body", "") or "", assets=assets)
-
-
-def pick_asset_for_platform(ri: ReleaseInfo, app_keyword: str) -> Optional[ReleaseAsset]:
-    """Chọn asset phù hợp OS (ưu tiên Windows portable .zip)."""
-    name_kw = app_keyword.lower()
-    os_name = "win" if sys.platform.startswith("win") else ("mac" if sys.platform == "darwin" else "linux")
-
-    def match(a: ReleaseAsset) -> bool:
-        n = a.name.lower()
-        if name_kw not in n:
-            return False
-        if os_name == "win":
-            return n.endswith(".zip") and ("win" in n or "windows" in n)
-        if os_name == "mac":
-            return any(n.endswith(ext) for ext in (".zip", ".tar.gz", ".dmg")) and any(k in n for k in ("darwin", "mac", "osx"))
-        # linux (nếu cần sau này)
-        return any(n.endswith(ext) for ext in (".AppImage", ".tar.gz", ".zip"))
-
-    # ưu tiên portable trước (tên có "portable")
-    portable = [a for a in ri.assets if match(a) and "portable" in a.name.lower()]
-    if portable:
-        return portable[0]
-    # fallback: cái đầu tiên phù hợp
-    for a in ri.assets:
-        if match(a):
-            return a
-    return None
-
-
-def install_zip_windows(zip_path: Path, app_id: str, tag: str) -> Path:
-    """Giải nén zip vào %LOCALAPPDATA%/Paperforge/<app_id>/<tag>/ và trả về đường dẫn exe mới."""
-    base = Path(os.getenv("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
-    target = base / "Paperforge" / app_id / tag.lstrip("vV")
-    target.mkdir(parents=True, exist_ok=True)
-
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        zf.extractall(target)
-
-    # Tìm exe có chữ Supervisor/Student
-    exe = None
-    for p in target.rglob("*.exe"):
-        if app_id.lower() in p.name.lower():
-            exe = p
-            break
-    if not exe:
-        # fallback: lấy *.exe đầu tiên
-        for p in target.rglob("*.exe"):
-            exe = p
-            break
-    if not exe:
-        raise RuntimeError("Cannot locate .exe inside extracted update.")
-    return exe
-
-
-def check_update(repo: str, app_keyword: str, current_version: str, token: Optional[str] = None) -> Tuple[bool, ReleaseInfo, Optional[ReleaseAsset]]:
-    ri = get_latest_release(repo, token=token)
-    latest = _version_tuple(ri.tag)
-    current = _version_tuple(current_version)
-    if latest <= current or not ri.assets:
-        return False, ri, None
-    asset = pick_asset_for_platform(ri, app_keyword)
-    return (asset is not None), ri, asset
-
-
-def download_and_stage_update(repo: str, app_keyword: str, current_version: str, app_id: str) -> Optional[Path]:
-    """Tải & bung bản mới; trả về đường dẫn exe/app mới, hoặc None nếu không có."""
-    token = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")  # optional
-    has, ri, asset = check_update(repo, app_keyword, current_version, token=token)
-    if not has or not asset:
-        return None
-
-    tmp = Path(tempfile.gettempdir()) / f"{asset.name}"
-    _download(asset.download_url, tmp, token=token)
-
-    if sys.platform.startswith("win"):
-        return install_zip_windows(tmp, app_id=app_id, tag=ri.tag)
-
-    # macOS: nếu asset là .zip chứa app bundle → giải nén ~/Library/Application Support/Paperforge/<app_id>/<tag>/
-    if sys.platform == "darwin":
-        # MVP: chỉ tải file và mở thư mục cho người dùng (hoặc bạn có thể thêm code giải nén .zip ở đây)
-        return tmp  # caller sẽ mở Finder/hiển thị hướng dẫn
-
-    # linux: tương tự mac — để sau
-    return tmp
+def check_for_updates_safely(app_kind: str, status_cb=None, on_update_url=None) -> None:
+    has, ver, url = check_update_info(app_kind)
+    if not has:
+        if status_cb:
+            status_cb("Up-to-date" if ver else "No updates")
+        return
+    if status_cb:
+        status_cb(f"Update {ver} available")
+    if url:
+        if on_update_url:
+            on_update_url(url)
+        else:
+            webbrowser.open(url)

@@ -66,7 +66,7 @@ from shared.events import (
 from shared.models import Manifest, ManuscriptType
 from shared.paths import manuscript_root, manuscript_subdirs, slugify
 from shared.timeutil import iso_to_local_str
-from shared.updater import download_and_stage_update
+from shared.updater import check_for_updates_safely, download_and_stage_update
 from shared.version import APP_VERSION, GITHUB_REPO
 
 APP_NAME = 'Paperforge — Student'
@@ -306,6 +306,10 @@ class StudentWindow(QMainWindow):
 
         # Auto-check update (silent) sau 3s
         QTimer.singleShot(3000, self._check_updates_silent)
+        QTimer.singleShot(1800, lambda: check_for_updates_safely(
+            "Student",
+            status_cb=lambda msg: self.statusBar().showMessage(msg, 4000),
+        ))
 
     # ──────────────────────────────────────────────────────────────────────
     # Updates (manual & silent)

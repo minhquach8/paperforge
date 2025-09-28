@@ -42,7 +42,7 @@ from shared.events import get_submission_times, returned_event, write_event
 from shared.latex.builder import build_pdf, detect_main_tex
 from shared.latex.diff import build_diff_pdf
 from shared.timeutil import iso_to_local_str
-from shared.updater import download_and_stage_update
+from shared.updater import check_for_updates_safely, download_and_stage_update
 from shared.version import APP_VERSION, GITHUB_REPO
 
 APP_NAME = 'Paperforge — Supervisor'
@@ -399,6 +399,11 @@ class SupervisorWindow(QMainWindow):
 
         # Auto-check update (silent) ~3s sau khi mở app
         QTimer.singleShot(3000, self._check_updates_silent)
+        QTimer.singleShot(1500, lambda: check_for_updates_safely(
+            "Supervisor",
+            status_cb=lambda msg: self.statusBar().showMessage(msg, 4000),
+            on_update_url=lambda url: __import__("webbrowser").open(url),
+        ))
 
     # ──────────────────────────────────────────────────────────────────────
     # Updates (manual & silent)
