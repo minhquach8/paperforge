@@ -5,6 +5,7 @@ import json
 import shutil
 import subprocess
 import sys
+import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -41,6 +42,8 @@ from shared.events import get_submission_times, returned_event, write_event
 from shared.latex.builder import build_pdf, detect_main_tex
 from shared.latex.diff import build_diff_pdf
 from shared.timeutil import iso_to_local_str
+from shared.updater import download_and_stage_update
+from shared.version import APP_VERSION, GITHUB_REPO
 
 APP_NAME = 'Paperforge — Supervisor'
 RECENTS_KEY = 'supervisor_recent_roots'
@@ -60,7 +63,6 @@ STATUS_COLOURS = {
 def open_with_default_app(path: Path) -> None:
     if sys.platform.startswith('win'):
         import os
-
         os.startfile(str(path))  # type: ignore[attr-defined]
     elif sys.platform == 'darwin':
         subprocess.run(['open', str(path)], check=False)
@@ -264,6 +266,14 @@ class SupervisorWindow(QMainWindow):
             self._toggle_autorescan,
             checkable=True,
         )
+        tb.addSeparator()
+        # NEW: Check for updates
+        self.act_check_update = _act(
+            QStyle.SP_BrowserReload,
+            f'Check for updates… (v{APP_VERSION})',
+            self._check_updates,
+            checkable=False,
+        )
 
         # Current root label
         self.lbl_root = QLabel('Students’ Root: (none)', self)
@@ -386,6 +396,68 @@ class SupervisorWindow(QMainWindow):
 
         self.setCentralWidget(central)
         self.statusBar().showMessage('Ready', 3000)
+
+        # Auto-check update (silent) ~3s sau khi mở app
+        QTimer.singleShot(3000, self._check_updates_silent)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Updates (manual & silent)
+    # ──────────────────────────────────────────────────────────────────────
+    def _check_updates(self) -> None:
+        """Manual check – luôn hiển thị thông báo."""
+        self._do_check_update(silent=False)
+
+    def _check_updates_silent(self) -> None:
+        """Silent check – chỉ báo khi có bản mới."""
+        self._do_check_update(silent=True)
+
+    def _do_check_update(self, silent: bool) -> None:
+        try:
+            if not silent:
+                self.statusBar().showMessage('Checking updates…', 3000)
+
+            # app_keyword giúp chọn đúng asset theo tên file trên Release
+            app_keyword = "Supervisor"
+            app_id = "supervisor"
+
+            new_path = download_and_stage_update(GITHUB_REPO, app_keyword, APP_VERSION, app_id=app_id)
+            if not new_path:
+                if not silent:
+                    QMessageBox.information(self, "Updates", f"You're on the latest version (v{APP_VERSION}).")
+                return
+
+            # Có bản mới đã tải xong
+            if sys.platform.startswith("win"):
+                ans = QMessageBox.question(
+                    self, "Update ready",
+                    f"A new version has been downloaded.\n\nLaunch the updated app now?\n\n{new_path}",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                if ans == QMessageBox.Yes:
+                    try:
+                        subprocess.Popen([str(new_path)], close_fds=True)
+                    finally:
+                        QApplication.quit()
+                else:
+                    # Mở thư mục để người dùng tự chạy sau
+                    open_with_default_app(Path(new_path).parent)
+            elif sys.platform == "darwin":
+                # MVP cho macOS: mở thư mục chứa gói tải về (zip/dmg) để kéo vào Applications
+                QMessageBox.information(
+                    self, "Update downloaded",
+                    "An update has been downloaded.\n"
+                    "Please open the folder and move the new app into Applications."
+                )
+                open_with_default_app(Path(new_path).parent)
+            else:
+                QMessageBox.information(self, "Update downloaded", f"Downloaded to: {new_path}")
+
+        except Exception as e:
+            if silent:
+                # im lặng: chỉ log nhẹ nhàng ở status bar để khỏi làm phiền
+                self.statusBar().showMessage(f'Update check failed: {e}', 5000)
+            else:
+                QMessageBox.warning(self, "Update failed", str(e))
 
     # ──────────────────────────────────────────────────────────────────────
     # Recents & root helpers
@@ -904,6 +976,7 @@ class SupervisorWindow(QMainWindow):
         open_act = menu.addAction('Open')
         notes_act = menu.addAction('Review notes…')
         ret_act = menu.addAction('Return selected')
+        update_act = menu.addAction('Check for updates…')
         act = menu.exec_(self.tree.viewport().mapToGlobal(pos))
         if act == open_act:
             if not item.data(0, Qt.UserRole) and item.childCount():
@@ -917,6 +990,8 @@ class SupervisorWindow(QMainWindow):
             self._open_notes_dialog()
         elif act == ret_act:
             self._return_selected_batch()
+        elif act == update_act:
+            self._check_updates()
 
 
 def main() -> None:

@@ -95,3 +95,21 @@ jobs:
           name: windows-portable
           path: out\*.zip
           if-no-files-found: error
+
+      # đọc version từ shared/version.py
+      - name: Read version
+        id: ver
+        shell: bash
+        run: echo "version=$(python - << 'PY'\nfrom shared.version import APP_VERSION\nprint(APP_VERSION)\nPY\n)" >> $GITHUB_OUTPUT
+
+      # tạo GitHub Release & upload assets
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: Paperforge v${{ steps.ver.outputs.version }}
+          draft: false
+          prerelease: false
+          files: |
+            dist/Paperforge-Supervisor-Portable-win64.zip
+            dist/Paperforge-Student-Portable-win64.zip

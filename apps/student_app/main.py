@@ -10,7 +10,7 @@ from pathlib import Path
 from time import time
 from typing import Optional
 
-from PySide6.QtCore import QSize, Qt
+from PySide6.QtCore import QSettings, QSize, Qt, QTimer
 from PySide6.QtGui import QAction, QIcon, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -66,6 +66,8 @@ from shared.events import (
 from shared.models import Manifest, ManuscriptType
 from shared.paths import manuscript_root, manuscript_subdirs, slugify
 from shared.timeutil import iso_to_local_str
+from shared.updater import download_and_stage_update
+from shared.version import APP_VERSION, GITHUB_REPO
 
 APP_NAME = 'Paperforge — Student'
 
@@ -85,7 +87,6 @@ def open_with_default_app(path: Path) -> None:
     """Open a file with the system default application."""
     if sys.platform.startswith('win'):
         import os
-
         os.startfile(str(path))  # type: ignore[attr-defined]
     elif sys.platform == 'darwin':
         subprocess.run(['open', str(path)], check=False)
@@ -121,6 +122,7 @@ class StudentWindow(QMainWindow):
       • Header “card” shows working folder, always copyable.
       • Resizable panes: History (top), Inbox + Comments preview (bottom).
       • Inbox quick search filter.
+      • Auto-update (silent) + manual Check for updates…
     """
 
     def __init__(self) -> None:
@@ -135,20 +137,17 @@ class StudentWindow(QMainWindow):
         self.addToolBar(tb)
 
         style = self.style()
-
-        def std_icon(sp):
-            return style.standardIcon(sp)
+        def std_icon(sp): return style.standardIcon(sp)
 
         act_new = QAction(std_icon(QStyle.SP_FileIcon), 'New', self)
         act_open = QAction(std_icon(QStyle.SP_DirOpenIcon), 'Open', self)
         act_commit = QAction(std_icon(QStyle.SP_DialogSaveButton), 'Commit', self)
         act_submit = QAction(std_icon(QStyle.SP_ArrowRight), 'Submit', self)
-        act_setroot = QAction(
-            std_icon(QStyle.SP_DirLinkIcon), 'Set/Change Students’ Root…', self
-        )
+        act_setroot = QAction(std_icon(QStyle.SP_DirLinkIcon), 'Set/Change Students’ Root…', self)
         act_hist = QAction(std_icon(QStyle.SP_BrowserReload), 'Refresh history', self)
         act_inbox = QAction(std_icon(QStyle.SP_BrowserReload), 'Refresh inbox', self)
         act_restore = QAction(std_icon(QStyle.SP_DialogResetButton), 'Restore…', self)
+        act_update = QAction(std_icon(QStyle.SP_BrowserReload), f'Check for updates… (v{APP_VERSION})', self)
 
         # Shortcuts (Mac-friendly)
         act_new.setShortcut(QKeySequence.New)
@@ -168,18 +167,12 @@ class StudentWindow(QMainWindow):
         act_hist.triggered.connect(self._refresh_history)
         act_inbox.triggered.connect(self.refresh_inbox)
         act_restore.triggered.connect(self.restore_selected_commit)
+        act_update.triggered.connect(self._check_updates)
 
-        for a in (
-            act_new,
-            act_open,
-            act_commit,
-            act_submit,
-            act_setroot,
-            act_hist,
-            act_inbox,
-            act_restore,
-        ):
+        for a in (act_new, act_open, act_commit, act_submit, act_setroot, act_hist, act_inbox, act_restore):
             tb.addAction(a)
+        tb.addSeparator()
+        tb.addAction(act_update)
 
         # ── Central layout ────────────────────────────────────────────────
         central = QWidget(self)
@@ -202,9 +195,7 @@ class StudentWindow(QMainWindow):
         header.addWidget(self.mapping_label)
         header_box = QGroupBox('')
         header_box.setLayout(header)
-        header_box.setStyleSheet(
-            'QGroupBox { border: 1px solid #e3e3e3; border-radius: 8px; margin-top: 4px; }'
-        )
+        header_box.setStyleSheet('QGroupBox { border: 1px solid #e3e3e3; border-radius: 8px; margin-top: 4px; }')
         outer.addWidget(header_box)
 
         # Splitter: top (History) / bottom (Inbox + Comments)
@@ -217,7 +208,7 @@ class StudentWindow(QMainWindow):
         self.history_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.history_list.itemSelectionChanged.connect(self._on_history_selection)
 
-        # Right-side history actions (compact buttons for clarity)
+        # Right-side history actions
         hist_btns = QVBoxLayout()
         self.btn_refresh_hist = QPushButton('Refresh')
         self.btn_restore = QPushButton('Restore to working copy…')
@@ -234,16 +225,14 @@ class StudentWindow(QMainWindow):
         # Inbox + comments splitter
         split_bottom = QSplitter(Qt.Horizontal, self)
 
-        # Inbox group
+        # Inbox
         inbox_box = QGroupBox('Inbox — reviews returned by supervisor')
         inbox_layout = QVBoxLayout(inbox_box)
         # Search field
         search_row = QHBoxLayout()
         search_row.addWidget(QLabel('Filter:'))
         self.inbox_filter = QLineEdit(self)
-        self.inbox_filter.setPlaceholderText(
-            'Search in submission id / filename / label'
-        )
+        self.inbox_filter.setPlaceholderText('Search in submission id / filename / label')
         self.inbox_filter.textChanged.connect(self._apply_inbox_filter)
         search_row.addWidget(self.inbox_filter)
         inbox_layout.addLayout(search_row)
@@ -268,7 +257,7 @@ class StudentWindow(QMainWindow):
         inbox_btns.addWidget(self.btn_pull_review)
         inbox_layout.addLayout(inbox_btns)
 
-        # Comments group
+        # Comments
         comments_box = QGroupBox('Comments (read-only preview)')
         comments_layout = QVBoxLayout(comments_box)
         self.comments_preview = QTextEdit(self)
@@ -288,7 +277,7 @@ class StudentWindow(QMainWindow):
         outer.addWidget(split_main, stretch=1)
         self.setCentralWidget(central)
 
-        # Footer credit (centred)
+        # Footer credit
         credit = QLabel('Made by Minh Quach', self)
         credit.setStyleSheet('color:#666; margin-top:6px;')
         self.statusBar().addPermanentWidget(credit)
@@ -299,14 +288,79 @@ class StudentWindow(QMainWindow):
         # Initial disables
         self.btn_refresh_inbox.setEnabled(False)
 
-        # A tiny stylesheet for gentle polish
+        # Stylesheet
         self.setStyleSheet("""
             QListWidget { font-size: 13px; }
             QPushButton { padding: 6px 10px; }
             QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }
         """)
 
+        # Save/restore window state
+        self._settings = QSettings('Paperforge', 'Student')
+        if self._settings.value('geometry'):
+            self.restoreGeometry(self._settings.value('geometry'))
+        if self._settings.value('state'):
+            self.restoreState(self._settings.value('state'))
+
         self.statusBar().showMessage('Ready', 3000)
+
+        # Auto-check update (silent) sau 3s
+        QTimer.singleShot(3000, self._check_updates_silent)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Updates (manual & silent)
+    # ──────────────────────────────────────────────────────────────────────
+    def _check_updates(self) -> None:
+        """Manual check – luôn hiện thông báo."""
+        self._do_check_update(silent=False)
+
+    def _check_updates_silent(self) -> None:
+        """Silent check – chỉ báo khi có bản mới."""
+        self._do_check_update(silent=True)
+
+    def _do_check_update(self, silent: bool) -> None:
+        try:
+            if not silent:
+                self.statusBar().showMessage('Checking updates…', 3000)
+
+            # Identify đúng asset Student trong Releases
+            app_keyword = "Student"
+            app_id = "student"
+
+            new_path = download_and_stage_update(GITHUB_REPO, app_keyword, APP_VERSION, app_id=app_id)
+            if not new_path:
+                if not silent:
+                    QMessageBox.information(self, "Updates", f"You're on the latest version (v{APP_VERSION}).")
+                return
+
+            # Có bản mới
+            if sys.platform.startswith("win"):
+                ans = QMessageBox.question(
+                    self, "Update ready",
+                    f"A new version has been downloaded.\n\nLaunch the updated app now?\n\n{new_path}",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                if ans == QMessageBox.Yes:
+                    try:
+                        subprocess.Popen([str(new_path)], close_fds=True)
+                    finally:
+                        QApplication.quit()
+                else:
+                    open_with_default_app(Path(new_path).parent)
+            elif sys.platform == "darwin":
+                QMessageBox.information(
+                    self, "Update downloaded",
+                    "An update has been downloaded.\nPlease open the folder and move the new app into Applications."
+                )
+                open_with_default_app(Path(new_path).parent)
+            else:
+                QMessageBox.information(self, "Update downloaded", f"Downloaded to: {new_path}")
+
+        except Exception as e:
+            if silent:
+                self.statusBar().showMessage(f'Update check failed: {e}', 5000)
+            else:
+                QMessageBox.warning(self, "Update failed", str(e))
 
     # ──────────────────────────────────────────────────────────────────────
     # Small helpers
@@ -350,28 +404,20 @@ class StudentWindow(QMainWindow):
     # Create / Open
     # ──────────────────────────────────────────────────────────────────────
     def create_new(self) -> None:
-        parent = QFileDialog.getExistingDirectory(
-            self, 'Choose a parent directory for the manuscript'
-        )
+        parent = QFileDialog.getExistingDirectory(self, 'Choose a parent directory for the manuscript')
         if not parent:
             return
-        name, ok = QInputDialog.getText(
-            self, 'Manuscript name', 'Enter a manuscript name (e.g. Paper 1):'
-        )
+        name, ok = QInputDialog.getText(self, 'Manuscript name', 'Enter a manuscript name (e.g. Paper 1):')
         if not ok or not name.strip():
             return
-        journal, ok = QInputDialog.getText(
-            self, 'Target journal (optional)', 'Enter target journal (optional):'
-        )
+        journal, ok = QInputDialog.getText(self, 'Target journal (optional)', 'Enter target journal (optional):')
         if not ok:
             return
 
         slug = slugify(name)
         new_dir = Path(parent) / slug
         if new_dir.exists():
-            QMessageBox.warning(
-                self, 'Folder exists', f'The folder already exists:\n{new_dir}'
-            )
+            QMessageBox.warning(self, 'Folder exists', f'The folder already exists:\n{new_dir}')
             return
 
         new_dir.mkdir(parents=True, exist_ok=True)
@@ -405,25 +451,17 @@ class StudentWindow(QMainWindow):
     # ──────────────────────────────────────────────────────────────────────
     def commit_snapshot(self) -> None:
         if not self.working_dir:
-            QMessageBox.warning(
-                self,
-                'No manuscript',
-                'Please select or create a manuscript folder first.',
-            )
+            QMessageBox.warning(self, 'No manuscript', 'Please select or create a manuscript folder first.')
             return
         if not is_repo(self.working_dir):
             init_repo(self.working_dir)
 
-        message, ok = QInputDialog.getText(
-            self, 'Commit message', 'Describe your changes:', text='Checkpoint'
-        )
+        message, ok = QInputDialog.getText(self, 'Commit message', 'Describe your changes:', text='Checkpoint')
         if not ok or not message.strip():
             return
 
         c = repo_commit(self.working_dir, message=message.strip())
-        self.statusBar().showMessage(
-            f'Committed {c.id[:7]} at {int(c.timestamp)}', 5000
-        )
+        self.statusBar().showMessage(f'Committed {c.id[:7]} at {int(c.timestamp)}', 5000)
         self._refresh_history()
 
     def _refresh_history(self) -> None:
@@ -468,12 +506,8 @@ class StudentWindow(QMainWindow):
             QMessageBox.critical(self, 'Restore failed', str(e))
             return
 
-        self.statusBar().showMessage(
-            f'Restored {written} file(s) from {commit_id[:12]}', 6000
-        )
-        QMessageBox.information(
-            self, 'Restored', f'Working copy restored to commit:\n{commit_id[:12]}'
-        )
+        self.statusBar().showMessage(f'Restored {written} file(s) from {commit_id[:12]}', 6000)
+        QMessageBox.information(self, 'Restored', f'Working copy restored to commit:\n{commit_id[:12]}')
 
     # ──────────────────────────────────────────────────────────────────────
     # Mapping / Inbox
@@ -493,15 +527,6 @@ class StudentWindow(QMainWindow):
                 'Mapping updated',
                 f'Now linked to:\n{newmap["students_root"]}\n{newmap["student_name"]}/{newmap["slug"]}',
             )
-            
-    # def link_remote_for_current(self) -> None:
-    #     mapping = self._ensure_mapping()
-    #     if mapping:
-    #         self.btn_refresh_inbox.setEnabled(True)
-    #         QMessageBox.information(
-    #             self, 'Linked', 'Students’ Root mapping saved for this manuscript.'
-    #         )
-    #         self.refresh_inbox()
 
     def _ensure_mapping(self) -> Optional[dict]:
         if not self.working_dir:
@@ -513,17 +538,13 @@ class StudentWindow(QMainWindow):
 
         defaults = get_defaults()
         students_root_dir = QFileDialog.getExistingDirectory(
-            self,
-            'Select Students’ Root (OneDrive)',
-            dir=defaults.get('students_root') or '',
+            self, 'Select Students’ Root (OneDrive)', dir=defaults.get('students_root') or '',
         )
         if not students_root_dir:
             return None
 
         student_name, ok = QInputDialog.getText(
-            self,
-            'Student name',
-            'Enter your display name (as used by the supervisor):',
+            self, 'Student name', 'Enter your display name (as used by the supervisor):',
             text=defaults.get('student_name') or '',
         )
         if not ok or not student_name.strip():
@@ -531,19 +552,14 @@ class StudentWindow(QMainWindow):
 
         default_slug = slugify(self.working_dir.name)
         manuscript_slug, ok = QInputDialog.getText(
-            self,
-            'Manuscript slug',
-            'Slug for this manuscript folder:',
-            text=default_slug,
+            self, 'Manuscript slug', 'Slug for this manuscript folder:', text=default_slug,
         )
         if not ok or not manuscript_slug.strip():
             return None
         manuscript_slug = slugify(manuscript_slug)
 
         remember_defaults(students_root_dir, student_name.strip())
-        remember_mapping(
-            self.working_dir, students_root_dir, student_name.strip(), manuscript_slug
-        )
+        remember_mapping(self.working_dir, students_root_dir, student_name.strip(), manuscript_slug)
 
         return get_mapping(self.working_dir)
 
@@ -553,49 +569,31 @@ class StudentWindow(QMainWindow):
             return None
 
         defaults = get_defaults()
-        start_dir = (
-            (preset or {}).get('students_root') or defaults.get('students_root') or ''
-        )
-        students_root_dir = QFileDialog.getExistingDirectory(
-            self, 'Select Students’ Root (OneDrive)', dir=start_dir
-        )
+        start_dir = (preset or {}).get('students_root') or defaults.get('students_root') or ''
+        students_root_dir = QFileDialog.getExistingDirectory(self, 'Select Students’ Root (OneDrive)', dir=start_dir)
         if not students_root_dir:
             return None
 
-        student_name_default = (
-            (preset or {}).get('student_name') or defaults.get('student_name') or ''
-        )
+        student_name_default = (preset or {}).get('student_name') or defaults.get('student_name') or ''
         student_name, ok = QInputDialog.getText(
-            self,
-            'Student name',
-            'Enter your display name (as used by the supervisor):',
-            text=student_name_default,
+            self, 'Student name', 'Enter your display name (as used by the supervisor):', text=student_name_default,
         )
         if not ok or not student_name.strip():
             return None
 
         slug_default = (preset or {}).get('slug') or slugify(self.working_dir.name)
         manuscript_slug, ok = QInputDialog.getText(
-            self,
-            'Manuscript slug',
-            'Slug for this manuscript folder:',
-            text=slug_default,
+            self, 'Manuscript slug', 'Slug for this manuscript folder:', text=slug_default,
         )
         if not ok or not manuscript_slug.strip():
             return None
         manuscript_slug = slugify(manuscript_slug)
 
-        # Lưu
+        # Save
         remember_defaults(students_root_dir, student_name.strip())
-        remember_mapping(
-            self.working_dir, students_root_dir, student_name.strip(), manuscript_slug
-        )
+        remember_mapping(self.working_dir, students_root_dir, student_name.strip(), manuscript_slug)
 
-        return {
-            'students_root': students_root_dir,
-            'student_name': student_name.strip(),
-            'slug': manuscript_slug,
-        }
+        return {'students_root': students_root_dir, 'student_name': student_name.strip(), 'slug': manuscript_slug}
 
     def _apply_inbox_filter(self) -> None:
         q = (self.inbox_filter.text() or '').strip().lower()
@@ -635,7 +633,7 @@ class StudentWindow(QMainWindow):
             sub_id = subdir.name
             docx = subdir / 'returned.docx'
             doc = subdir / 'returned.doc'
-            html = subdir / 'review.html'  # pre-return preview (latex)
+            html = subdir / 'review.html'     # pre-return preview (latex)
             rhtml = subdir / 'returned.html'  # post-return (latex)
 
             target, label = None, None
@@ -655,9 +653,7 @@ class StudentWindow(QMainWindow):
             if ret_ts:
                 when = f'returned {iso_to_local_str(ret_ts)}'
 
-            item = QListWidgetItem(
-                f'Submission {sub_id} — {label} · {when}', self.inbox_list
-            )
+            item = QListWidgetItem(f'Submission {sub_id} — {label} · {when}', self.inbox_list)
             item.setData(Qt.UserRole, str(target))
             item.setData(Qt.UserRole + 1, sub_id)
             item.setData(Qt.UserRole + 2, str((target.parent / 'comments.json')))
@@ -678,11 +674,7 @@ class StudentWindow(QMainWindow):
 
     def pull_selected_review(self) -> None:
         if not self.working_dir:
-            QMessageBox.warning(
-                self,
-                'No manuscript',
-                'Please select or create a manuscript folder first.',
-            )
+            QMessageBox.warning(self, 'No manuscript', 'Please select or create a manuscript folder first.')
             return
         items = self.inbox_list.selectedItems()
         if not items:
@@ -716,10 +708,7 @@ class StudentWindow(QMainWindow):
         )
         if resp == QMessageBox.Yes:
             try:
-                repo_commit(
-                    self.working_dir,
-                    message=f'Save supervisor review for submission {sub_id}',
-                )
+                repo_commit(self.working_dir, message=f'Save supervisor review for submission {sub_id}')
                 self._refresh_history()
             except Exception:
                 pass
@@ -737,9 +726,7 @@ class StudentWindow(QMainWindow):
             return
         cpath = Path(items[0].data(Qt.UserRole + 2) or '')
         if not cpath.exists():
-            self.comments_preview.setPlaceholderText(
-                'No comments.json found for this review.'
-            )
+            self.comments_preview.setPlaceholderText('No comments.json found for this review.')
             return
 
         try:
@@ -774,22 +761,13 @@ class StudentWindow(QMainWindow):
     # ──────────────────────────────────────────────────────────────────────
     def submit_to_supervisor(self) -> None:
         if not self.working_dir:
-            QMessageBox.warning(
-                self,
-                'No manuscript',
-                'Please select or create a manuscript folder first.',
-            )
+            QMessageBox.warning(self, 'No manuscript', 'Please select or create a manuscript folder first.')
             return
 
         if not head_commit_id(self.working_dir):
             repo_commit(self.working_dir, message='Initial snapshot (auto)')
 
-        message, ok = QInputDialog.getText(
-            self,
-            'Commit message',
-            'Message for this submission:',
-            text='Work ready for review',
-        )
+        message, ok = QInputDialog.getText(self, 'Commit message', 'Message for this submission:', text='Work ready for review')
         if ok and message.strip():
             repo_commit(self.working_dir, message=message.strip())
 
@@ -802,15 +780,11 @@ class StudentWindow(QMainWindow):
         student_name = mapping['student_name']
         manuscript_slug = mapping['slug']
 
-        dest_root = manuscript_root(
-            Path(students_root_dir), student_name, manuscript_slug
-        )
+        dest_root = manuscript_root(Path(students_root_dir), student_name, manuscript_slug)
         subs = manuscript_subdirs(dest_root)
 
         # Create submission package
-        submission_id = datetime.utcnow().strftime(
-            '%Y%m%d%H%M%S'
-        )  # stable id is fine here
+        submission_id = datetime.utcnow().strftime('%Y%m%d%H%M%S')  # stable id is fine here
         dest = subs['submissions'] / submission_id
         payload = dest / 'payload'
         payload.mkdir(parents=True, exist_ok=True)
@@ -819,10 +793,7 @@ class StudentWindow(QMainWindow):
             if p.is_dir():
                 continue
             rel = p.relative_to(self.working_dir)
-            if any(
-                part in {'.paperrepo', 'submissions', 'reviews', 'events'}
-                for part in rel.parts
-            ):
+            if any(part in {'.paperrepo', 'submissions', 'reviews', 'events'} for part in rel.parts):
                 continue
             (payload / rel).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(p, payload / rel)
@@ -832,9 +803,7 @@ class StudentWindow(QMainWindow):
         # Read journal from paper.yaml if present
         journal_val = None
         try:
-            paper_cfg = json.loads(
-                (self.working_dir / 'paper.yaml').read_text(encoding='utf-8')
-            )
+            paper_cfg = json.loads((self.working_dir / 'paper.yaml').read_text(encoding='utf-8'))
             journal_val = (paper_cfg.get('journal') or '').strip() or None
         except Exception:
             pass
@@ -856,11 +825,16 @@ class StudentWindow(QMainWindow):
 
         write_event(subs['events'], new_submission_event(submission_id))
         self.statusBar().showMessage(f'Submission created: {submission_id}', 6000)
-        QMessageBox.information(
-            self, 'Submitted', f'Submission has been created:\n{submission_id}'
-        )
+        QMessageBox.information(self, 'Submitted', f'Submission has been created:\n{submission_id}')
 
         self.refresh_inbox()
+
+    # Save window state
+    def closeEvent(self, ev):
+        if hasattr(self, '_settings'):
+            self._settings.setValue('geometry', self.saveGeometry())
+            self._settings.setValue('state', self.saveState())
+        super().closeEvent(ev)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
