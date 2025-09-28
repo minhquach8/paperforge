@@ -1,126 +1,123 @@
 from __future__ import annotations
 
 import os
-import shutil
+import shlex
 import subprocess
 from pathlib import Path
 from typing import Optional, Tuple
 
-from .tectonic_runtime import get_tectonic_path, tectonic_command_env
-
-try:
-    from shared.latex.tectonic_runtime import tectonic_command_env
-except Exception:
-    # Back-compat: gói cũ chỉ có get_tectonic_path / get_cache_dir
-    from shared.latex.tectonic_runtime import get_cache_dir, get_tectonic_path
-    def tectonic_command_env():
-        exe = str(get_tectonic_path())
-        env = os.environ.copy()
-        env.setdefault("TECTONIC_CACHE_DIR", str(get_cache_dir()))
-        return exe, env
-    
-def which(cmd: str) -> Optional[str]:
-    """Return absolute path to executable if available, else None."""
-    return shutil.which(cmd)
+from .tectonic_runtime import get_cache_dir, get_tectonic_path
 
 
-def detect_main_tex(work_dir: Path) -> Optional[Path]:
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+def detect_main_tex(root: Path) -> Optional[Path]:
     """
-    Heuristics to pick a main .tex file relative to work_dir.
-    Rules:
-      - Prefer a file literally named main.tex if present.
-      - Else prefer a single .tex at the root.
-      - Else fall back to the lexicographically first .tex found.
-      - Return a Path RELATIVE to work_dir. None if nothing found.
+    Tìm main .tex trong thư mục `root`. Thử theo thứ tự phổ biến.
+    Trả về path tương đối (so với root) nếu tìm thấy.
     """
-    candidates = list(work_dir.glob("*.tex"))
-    if (work_dir / "main.tex").exists():
-        return Path("main.tex")
-    if len(candidates) == 1:
-        return candidates[0].name and Path(candidates[0].name)
-    # Fallback: first .tex anywhere
-    deep = sorted([p for p in work_dir.rglob("*.tex") if p.is_file()])
-    if deep:
+    candidates = [
+        "main.tex",
+        "paper.tex",
+        "manuscript.tex",
+        "thesis.tex",
+    ]
+    # 1) ưu tiên ứng viên trên
+    for name in candidates:
+        p = root / name
+        if p.exists():
+            return Path(name)
+    # 2) fallback: lấy file .tex có kích thước lớn nhất (đỡ trúng preamble)
+    tex_files = sorted((p for p in root.rglob("*.tex") if p.is_file()), key=lambda x: x.stat().st_size, reverse=True)
+    if tex_files:
         try:
-            return deep[0].relative_to(work_dir)
+            return tex_files[0].relative_to(root)
         except Exception:
-            # If relative fails, return absolute, caller will resolve correctly
-            return deep[0]
+            return tex_files[0].name and Path(tex_files[0].name)
     return None
 
 
-def build_pdf(work_dir: Path, main_rel: Path, out_pdf: Path) -> Tuple[bool, str, Optional[Path]]:
-    """
-    Build a LaTeX project using Tectonic.
+def _tectonic_env() -> dict:
+    """Tạo ENV chuẩn cho Tectonic (luôn là dict)."""
+    env = os.environ.copy()
+    cache_dir = get_cache_dir()
+    env["TECTONIC_CACHE_DIR"] = str(cache_dir)
+    # An toàn thêm—tránh locale issues trên Windows lab
+    env.setdefault("LC_ALL", "C.UTF-8")
+    env.setdefault("LANG", "C.UTF-8")
+    return env
 
-    Args:
-      work_dir: directory containing LaTeX sources.
-      main_rel: main tex file RELATIVE to work_dir (as returned by detect_main_tex).
-      out_pdf: desired output PDF path (we will move/copy to this exact path).
 
-    Returns:
-      (ok, log, produced_path):
-        - ok: True on success
-        - log: combined stdout/stderr of the build
-        - produced_path: final PDF path on success, else None
+def _tectonic_cmd(workdir: Path, main_rel: Path, out_pdf: Path) -> Tuple[list[str], dict]:
     """
-    log_chunks: list[str] = []
+    Lệnh tectonic compile chuẩn (ra PDF), trả về (cmd_list, env_dict).
+    """
+    exe = get_tectonic_path()  # Path tới vendor/.../tectonic(.exe) hoặc 'tectonic' nếu có trên PATH
+    outdir = out_pdf.parent
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # Tectonic sẽ đặt file PDF theo tên .tex => để ra đúng đích, ta dùng --outdir
+    cmd = [
+        str(exe),
+        "-X", "compile",
+        str(main_rel),          # đường dẫn tương đối so với workdir
+        "--outdir", str(outdir),
+        "--keep-logs",
+        "--synctex",
+        # Bạn có thể bật/đổi backend nếu cần:
+        # "--bury-errors"   # không nên khi muốn xem log
+    ]
+    return cmd, _tectonic_env()
+
+
+def _read_file_safely(p: Path) -> str:
     try:
-        tectonic = get_tectonic_path()
-    except Exception as e:
-        # Friendly message; caller can surface this in the UI
-        return False, f"[Tectonic] {e}", None
+        return p.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
 
-    env = tectonic_command_env()
 
-    # Tectonic writes outputs into an output directory, not a single filename.
-    # We compile into out_pdf.parent and then rename the produced PDF into out_pdf.
-    out_dir = out_pdf.parent
-    out_dir.mkdir(parents=True, exist_ok=True)
+# -----------------------------------------------------------------------------
+# Public API
+# -----------------------------------------------------------------------------
+def build_pdf(workdir: Path, main_rel: Path, out_pdf: Path) -> Tuple[bool, str, Optional[Path]]:
+    """
+    Build PDF bằng Tectonic.
+    - workdir: thư mục chứa source (cwd khi chạy)
+    - main_rel: đường dẫn *.tex tương đối so với workdir
+    - out_pdf: đường dẫn PDF kỳ vọng (trong cùng/khác thư mục)
 
-    main_abs = (work_dir / main_rel).resolve()
-    if not main_abs.exists():
-        return False, f"Main .tex not found: {main_abs}", None
+    Trả về: (ok, log, produced_path|None)
+    """
+    workdir = workdir.resolve()
+    main_rel = Path(main_rel)
+    if not (workdir / main_rel).exists():
+        return False, f"Main TeX not found: {(workdir / main_rel)}", None
 
-    # Run tectonic. Compatible CLI flags:
-    #   tectonic -o <outdir> <main.tex>
-    # (Newer versions support `-X build`, but -o works broadly.)
-    cmd = [str(tectonic), "-o", str(out_dir), str(main_abs)]
+    cmd, env = _tectonic_cmd(workdir, main_rel, out_pdf)
     try:
         proc = subprocess.run(
             cmd,
-            cwd=str(work_dir),
-            env=env,
+            cwd=str(workdir),
+            env=env,                     # <-- luôn là dict
             capture_output=True,
             text=True,
             check=False,
         )
-        log = (proc.stdout or "") + "\n" + (proc.stderr or "")
-        log_chunks.append(log)
-        if proc.returncode != 0:
-            return False, "\n".join(log_chunks), None
+        log = (proc.stdout or "") + (proc.stderr or "")
+        # Kiểm tra file PDF đã có chưa (tectonic đặt theo tên main)
+        produced_pdf = out_pdf
+        if not produced_pdf.exists():
+            # Nếu tên PDF khác (ví dụ tên của main.tex), tìm file lớn nhất trong outdir
+            pdfs = sorted(out_pdf.parent.glob("*.pdf"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if pdfs:
+                produced_pdf = pdfs[0]
+        if proc.returncode != 0 or not produced_pdf.exists():
+            return False, f"$ {' '.join(shlex.quote(x) for x in cmd)}\n\n{log}", None
+        return True, log, produced_pdf
+    except FileNotFoundError:
+        return False, "Tectonic executable not found. Please bundle vendor/tectonic correctly.", None
     except Exception as e:
+        # lỗi như "'tuple' object has no attribute 'keys'" rơi vào đây nếu env sai kiểu
         return False, f"Failed to invoke Tectonic: {e}", None
-
-    # Tectonic emits a PDF named after the main file (e.g. main.pdf) into out_dir.
-    produced = out_dir / (main_abs.stem + ".pdf")
-    if not produced.exists():
-        # Some templates may rename; try any *.pdf newer in out_dir
-        pdfs = sorted([p for p in out_dir.glob("*.pdf")], key=lambda p: p.stat().st_mtime, reverse=True)
-        if pdfs:
-            produced = pdfs[0]
-        else:
-            return False, "No PDF was produced by Tectonic.", None
-
-    if produced.resolve() != out_pdf.resolve():
-        # Move/rename to the exact expected path
-        try:
-            if out_pdf.exists():
-                out_pdf.unlink()
-            produced.rename(out_pdf)
-        except Exception:
-            # If rename across devices fails, fall back to copy
-            import shutil
-            shutil.copy2(produced, out_pdf)
-
-    return True, "\n".join(log_chunks), out_pdf
