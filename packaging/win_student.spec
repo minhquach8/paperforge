@@ -18,6 +18,7 @@ app_entry = str(PROJECT_ROOT / "apps" / "student_app" / "main.py")
 datas = [
     # copy whole assets dir if you use images/icons in the app:
     (str(PROJECT_ROOT / "assets"), "assets"),
+    ('shared/paperforge_build.json', '.') ,
     # bundle tectonic.exe into the same relative path the app expects:
     (str(PROJECT_ROOT / "vendor" / "tectonic" / "windows-x86_64" / "tectonic.exe"),
      "vendor/tectonic/windows-x86_64"),

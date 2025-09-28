@@ -3,9 +3,14 @@ from __future__ import annotations
 
 import html
 import json
+import json as _json
 import shutil
 import subprocess
 import sys
+import urllib.error
+
+# --- quick version helpers ---
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -47,6 +52,34 @@ from shared.timeutil import iso_to_local_str
 # Updater (portable) – hỗ trợ cả API cũ/lẫn mới
 from shared.updater import cleanup_legacy_appdata_if_any, download_and_stage_update
 from shared.version import APP_VERSION
+
+
+def _vtuple(s: str) -> tuple[int, ...]:
+    return tuple(int(x) for x in s.split('.') if x.isdigit())
+
+def _is_newer(cur: str, latest: str) -> bool:
+    try:
+        return _vtuple(cur) < _vtuple(latest)
+    except Exception:
+        # nếu parse lỗi, coi như có update để không chặn người dùng
+        return True
+
+def _fetch_latest_version(repo: str, timeout_sec: float = 6.0) -> str | None:
+    """
+    Trả về 'x.y.z' từ /releases/latest, hoặc None nếu lỗi/không có.
+    """
+    url = f"https://api.github.com/repos/{repo}/releases/latest"
+    req = urllib.request.Request(url, headers={"User-Agent": "Paperforge-Updater"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            data = _json.loads(resp.read().decode("utf-8"))
+        tag = (data.get("tag_name") or "").strip()
+        if not tag:
+            return None
+        return tag.lstrip('v').strip()
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError):
+        return None
+
 
 APP_NAME = "Paperforge — Supervisor"
 RECENTS_KEY = "supervisor_recent_roots"
@@ -505,51 +538,78 @@ exit
             QMessageBox.warning(self, "Update", f"Failed to apply update:\n{e}")
 
     def _check_updates(self) -> None:
+        from shared.version import APP_VERSION, GITHUB_REPO
         ans = QMessageBox.question(
             self, "Check for updates",
-            "Check online for a new version now?",
+            f"Current version: v{APP_VERSION}\nCheck online for a new version now?",
             QMessageBox.Yes | QMessageBox.No,
         )
         if ans != QMessageBox.Yes:
             return
 
-        # Progress dialog (indeterminate)
-        dlg = QProgressDialog("Checking & downloading update…", None, 0, 0, self)
+        latest = _fetch_latest_version(GITHUB_REPO, timeout_sec=6)
+        if not latest:
+            QMessageBox.information(self, "Updates", "Couldn't reach update server. Please try again later.")
+            return
+
+        if not _is_newer(APP_VERSION, latest):
+            QMessageBox.information(self, "Updates", f"You're on the latest version (v{APP_VERSION}).")
+            return
+
+        # Có bản mới -> chạy worker với progress + watchdog timeout
+        dlg = QProgressDialog("Downloading update…", None, 0, 0, self)
         dlg.setWindowModality(Qt.ApplicationModal)
         dlg.setCancelButton(None)
         dlg.setWindowTitle("Updates")
         dlg.show()
-        self._update_dlg = dlg  # giữ tham chiếu tránh GC
+        self._update_dlg = dlg
 
-        # Start worker
         w = UpdateWorker(self)
-        self._update_worker = w  # giữ tham chiếu tránh GC
+        self._update_worker = w
 
         def _cleanup():
-            if hasattr(self, "_update_dlg") and self._update_dlg is not None:
+            if getattr(self, "_update_dlg", None):
                 self._update_dlg.close()
                 self._update_dlg = None
             self._update_worker = None
 
-        def _ok(path_like):
+        # watchdog: 30s mà chưa xong thì cắt
+        self._update_watchdog = QTimer(self)
+        self._update_watchdog.setSingleShot(True)
+        def _on_timeout():
+            try:
+                if self._update_worker and self._update_worker.isRunning():
+                    self._update_worker.terminate()  # hard stop (chấp nhận cho TH mạng kẹt)
+            finally:
+                _cleanup()
+                QMessageBox.warning(self, "Updates", "Timed out while downloading. Please try again later.")
+        self._update_watchdog.timeout.connect(_on_timeout)
+        self._update_watchdog.start(30_000)
+
+        def _finish_ok(path_like):
+            self._update_watchdog.stop()
             _cleanup()
+            # với updater cũ: mở exe mới hoặc áp dụng in-place (tuỳ bạn đã cài)
             try:
                 self._apply_inplace_update(Path(str(path_like)))
             except Exception as ex:
                 QMessageBox.warning(self, "Update", f"Failed to apply update:\n{ex}")
 
-        def _uptodate():
+        def _finish_uptodate():
+            self._update_watchdog.stop()
             _cleanup()
             QMessageBox.information(self, "Updates", f"You're on the latest version (v{APP_VERSION}).")
 
-        def _err(msg):
+        def _finish_err(msg):
+            self._update_watchdog.stop()
             _cleanup()
             QMessageBox.warning(self, "Update failed", msg)
 
-        w.done.connect(_ok)
-        w.up_to_date.connect(_uptodate)
-        w.error.connect(_err)
+        w.done.connect(_finish_ok)
+        w.up_to_date.connect(_finish_uptodate)
+        w.error.connect(_finish_err)
         w.start()
+
 
 
     # ──────────────────────────────────────────────────────────────────────

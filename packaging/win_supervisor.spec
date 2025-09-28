@@ -16,6 +16,7 @@ datas = [
     (str(PROJECT_ROOT / "assets"), "assets"),
     (str(PROJECT_ROOT / "vendor" / "tectonic" / "windows-x86_64" / "tectonic.exe"),
      "vendor/tectonic/windows-x86_64"),
+     ('shared/paperforge_build.json', '.') ,
 ]
 
 binaries = []
