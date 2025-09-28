@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -7,7 +8,17 @@ from typing import Optional, Tuple
 
 from .tectonic_runtime import get_tectonic_path, tectonic_command_env
 
-
+try:
+    from shared.latex.tectonic_runtime import tectonic_command_env
+except Exception:
+    # Back-compat: gói cũ chỉ có get_tectonic_path / get_cache_dir
+    from shared.latex.tectonic_runtime import get_cache_dir, get_tectonic_path
+    def tectonic_command_env():
+        exe = str(get_tectonic_path())
+        env = os.environ.copy()
+        env.setdefault("TECTONIC_CACHE_DIR", str(get_cache_dir()))
+        return exe, env
+    
 def which(cmd: str) -> Optional[str]:
     """Return absolute path to executable if available, else None."""
     return shutil.which(cmd)
