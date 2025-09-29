@@ -25,7 +25,7 @@ except Exception:
 
 USER_AGENT = "Paperforge-Updater/1.0 (+github)"
 # minisign -P public key (base64)
-MINISIGN_PUBKEY = "RWTAHzWyNSxp+ZHfFiZDtxITyG+9BKgLDpvveA5Ii50DaHY9u24BxzAJ"
+UPDATER_PUBKEY = "RWQLy6cizwaFR9iOagKScwuIBIfG5aM/BzGTEz7cFmb/SiJ0tQEKn/a7"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -145,7 +145,7 @@ def verify_minisign(zip_path: Path, sig_path: Path) -> bool:
     if not exe:
         # Không có minisign ⇒ coi là không verify được
         return False
-    cmd = [str(exe), "-V", "-P", MINISIGN_PUBKEY, "-m", str(zip_path), "-x", str(sig_path)]
+    cmd = [str(exe), "-V", "-P", UPDATER_PUBKEY, "-m", str(zip_path), "-x", str(sig_path)]
     r = subprocess.run(cmd, capture_output=True, text=True)
     return r.returncode == 0
 
