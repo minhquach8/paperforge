@@ -2,22 +2,17 @@
 from __future__ import annotations
 
 import json
-import json as _json
 import shutil
 import subprocess
 import sys
-import urllib.error
-
-# --- quick version helpers ---
-import urllib.request
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from time import time
 from typing import Optional
 
-from PySide6.QtCore import QSettings, QSize, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QIcon, QKeySequence, QPixmap
+from PySide6.QtCore import QSettings, QSize, Qt
+from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -31,7 +26,6 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
-    QProgressDialog,
     QPushButton,
     QSplitter,
     QStyle,
@@ -49,6 +43,9 @@ from paperrepo.repo import head_commit_id, init_repo, is_repo
 from paperrepo.repo import history as repo_history
 from paperrepo.repo import restore as repo_restore
 
+# ✅ Build info + Updater UI (flow chung với Supervisor)
+from shared.buildinfo import get_display_version, get_repo
+
 # App/shared helpers
 from shared.config import (
     get_defaults,
@@ -56,7 +53,7 @@ from shared.config import (
     remember_defaults,
     remember_mapping,
 )
-from shared.detect import detect_manuscript_type  # ✅ đúng module
+from shared.detect import detect_manuscript_type
 from shared.events import (
     get_submission_times,
     new_submission_event,
@@ -64,41 +61,11 @@ from shared.events import (
     write_event,
 )
 from shared.models import Manifest, ManuscriptType
-from shared.osutil import open_with_default_app  # ✅ dùng shared.osutil
+from shared.osutil import open_with_default_app
 from shared.paths import manuscript_root, manuscript_subdirs, slugify
 from shared.timeutil import iso_to_local_str
-
-# Updater portable – tương thích API cũ/lẫn mới
-from shared.updater import cleanup_legacy_appdata_if_any, download_and_stage_update
-from shared.version import APP_VERSION, GITHUB_REPO
-
-
-def _vtuple(s: str) -> tuple[int, ...]:
-    return tuple(int(x) for x in s.split('.') if x.isdigit())
-
-def _is_newer(cur: str, latest: str) -> bool:
-    try:
-        return _vtuple(cur) < _vtuple(latest)
-    except Exception:
-        # nếu parse lỗi, coi như có update để không chặn người dùng
-        return True
-
-def _fetch_latest_version(repo: str, timeout_sec: float = 6.0) -> str | None:
-    """
-    Trả về 'x.y.z' từ /releases/latest, hoặc None nếu lỗi/không có.
-    """
-    url = f"https://api.github.com/repos/{repo}/releases/latest"
-    req = urllib.request.Request(url, headers={"User-Agent": "Paperforge-Updater"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
-            data = _json.loads(resp.read().decode("utf-8"))
-        tag = (data.get("tag_name") or "").strip()
-        if not tag:
-            return None
-        return tag.lstrip('v').strip()
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError):
-        return None
-
+from shared.ui.update_qt import check_for_updates
+from shared.updater import cleanup_legacy_appdata_if_any
 
 APP_NAME = "Paperforge — Student"
 
@@ -112,45 +79,6 @@ def write_minimal_paper_yaml(dst: Path, title: str, journal: str = "") -> None:
     (dst / "paper.yaml").write_text(
         json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-
-
-class UpdateWorker(QThread):
-    done = Signal(object)       # path exe/installer mới (Path hoặc str)
-    up_to_date = Signal()
-    error = Signal(str)
-
-    def run(self):
-        from shared.updater import download_and_stage_update
-        from shared.version import APP_VERSION, GITHUB_REPO
-        try:
-            try:
-                # API cũ: (repo, keyword, version, app_id) -> path or None
-                res = download_and_stage_update(GITHUB_REPO, "Student", APP_VERSION, app_id="student")
-            except TypeError:
-                # API mới: (app_id) -> (status, detail)
-                res = download_and_stage_update("student")
-
-            if isinstance(res, tuple):
-                status, detail = res
-                if status == "up_to_date":
-                    self.up_to_date.emit(); return
-                if status == "staged":
-                    # detail: path tải xong
-                    self.done.emit(detail); return
-                self.error.emit(str(detail)); return
-
-            # API cũ
-            if isinstance(res, (str, Path)) and res:
-                self.done.emit(res); return
-
-            self.up_to_date.emit()
-
-        except Exception as e:
-            msg = str(e)
-            if "404" in msg or "Not Found" in msg:
-                self.up_to_date.emit()
-            else:
-                self.error.emit(msg)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -339,7 +267,7 @@ class StudentWindow(QMainWindow):
         credit = QLabel("Made by Minh Quach", self)
         credit.setStyleSheet("color:#666; margin-top:6px;")
         self.statusBar().addPermanentWidget(credit)
-        self.lbl_ver = QLabel(f"v{APP_VERSION}", self)
+        self.lbl_ver = QLabel(f"v{get_display_version()}", self)
         self.lbl_ver.setStyleSheet("color:#666; margin-left:12px;")
         self.statusBar().addPermanentWidget(self.lbl_ver)
 
@@ -372,146 +300,16 @@ class StudentWindow(QMainWindow):
         # KHÔNG auto-check update để tránh loop/not responding
 
     # ──────────────────────────────────────────────────────────────────────
-    # Updates (manual, in-place swap trên Windows)
+    # Updates (manual; dùng shared/ui/update_qt.py)
     # ──────────────────────────────────────────────────────────────────────
-    def _apply_inplace_update(self, staged_path: Path) -> None:
-        """
-        Windows portable: copy exe mới về đúng thư mục hiện tại, swap an toàn bằng .cmd,
-        rồi tự khởi động lại chính đường dẫn cũ.
-        macOS/Linux: mở thư mục chứa file tải về để người dùng thay thủ công.
-        """
-        try:
-            if sys.platform.startswith("win"):
-                exe = Path(sys.executable).resolve()
-                exe_dir = exe.parent
-                staged_path = Path(staged_path).resolve()
-                if not staged_path.exists():
-                    QMessageBox.warning(
-                        self, "Update", f"Downloaded file missing:\n{staged_path}"
-                    )
-                    return
-
-                # Copy về cạnh file đang chạy
-                new_copy = exe_dir / (exe.name + ".new")
-                shutil.copy2(staged_path, new_copy)
-
-                # Tạo script swap
-                swap = exe_dir / "_swap_update.cmd"
-                swap.write_text(
-                    rf"""@echo off
-setlocal
-set TARGET="{exe}"
-set NEW="{new_copy}"
-set OLD="{exe}.old"
-:wait
-ping 127.0.0.1 -n 2 >nul
-move /y %TARGET% %OLD% >nul 2>&1
-if errorlevel 1 goto wait
-move /y %NEW% %TARGET% >nul 2>&1
-del /f /q %OLD% >nul 2>&1
-start "" "%TARGET%"
-exit
-""",
-                    encoding="utf-8",
-                )
-
-                # Nếu staged ở AppData thì dọn nhẹ
-                try:
-                    if "AppData" in str(staged_path):
-                        shutil.rmtree(staged_path.parent, ignore_errors=True)
-                except Exception:
-                    pass
-
-                subprocess.Popen(["cmd", "/c", str(swap)], close_fds=True)
-                QApplication.quit()
-            else:
-                QMessageBox.information(
-                    self,
-                    "Update downloaded",
-                    "An update has been downloaded. Please replace your app with the new one.",
-                )
-                p = Path(staged_path)
-                if p.exists():
-                    if sys.platform == "darwin":
-                        subprocess.run(["open", str(p.parent)], check=False)
-                    else:
-                        subprocess.run(["xdg-open", str(p.parent)], check=False)
-        except Exception as e:
-            QMessageBox.warning(self, "Update", f"Failed to apply update:\n{e}")
-
     def _check_updates(self) -> None:
-        from shared.version import APP_VERSION, GITHUB_REPO
-        ans = QMessageBox.question(
-            self, "Check for updates",
-            f"Current version: v{APP_VERSION}\nCheck online for a new version now?",
-            QMessageBox.Yes | QMessageBox.No,
+        check_for_updates(
+            self,
+            app_id="student",
+            repo=get_repo(),
+            current_version=get_display_version(),
+            app_keyword="Student",
         )
-        if ans != QMessageBox.Yes:
-            return
-
-        latest = _fetch_latest_version(GITHUB_REPO, timeout_sec=6)
-        if not latest:
-            QMessageBox.information(self, "Updates", "Couldn't reach update server. Please try again later.")
-            return
-
-        if not _is_newer(APP_VERSION, latest):
-            QMessageBox.information(self, "Updates", f"You're on the latest version (v{APP_VERSION}).")
-            return
-
-        # Có bản mới -> chạy worker với progress + watchdog timeout
-        dlg = QProgressDialog("Downloading update…", None, 0, 0, self)
-        dlg.setWindowModality(Qt.ApplicationModal)
-        dlg.setCancelButton(None)
-        dlg.setWindowTitle("Updates")
-        dlg.show()
-        self._update_dlg = dlg
-
-        w = UpdateWorker(self)
-        self._update_worker = w
-
-        def _cleanup():
-            if getattr(self, "_update_dlg", None):
-                self._update_dlg.close()
-                self._update_dlg = None
-            self._update_worker = None
-
-        # watchdog: 30s mà chưa xong thì cắt
-        self._update_watchdog = QTimer(self)
-        self._update_watchdog.setSingleShot(True)
-        def _on_timeout():
-            try:
-                if self._update_worker and self._update_worker.isRunning():
-                    self._update_worker.terminate()  # hard stop (chấp nhận cho TH mạng kẹt)
-            finally:
-                _cleanup()
-                QMessageBox.warning(self, "Updates", "Timed out while downloading. Please try again later.")
-        self._update_watchdog.timeout.connect(_on_timeout)
-        self._update_watchdog.start(30_000)
-
-        def _finish_ok(path_like):
-            self._update_watchdog.stop()
-            _cleanup()
-            # với updater cũ: mở exe mới hoặc áp dụng in-place (tuỳ bạn đã cài)
-            try:
-                self._apply_inplace_update(Path(str(path_like)))
-            except Exception as ex:
-                QMessageBox.warning(self, "Update", f"Failed to apply update:\n{ex}")
-
-        def _finish_uptodate():
-            self._update_watchdog.stop()
-            _cleanup()
-            QMessageBox.information(self, "Updates", f"You're on the latest version (v{APP_VERSION}).")
-
-        def _finish_err(msg):
-            self._update_watchdog.stop()
-            _cleanup()
-            QMessageBox.warning(self, "Update failed", msg)
-
-        w.done.connect(_finish_ok)
-        w.up_to_date.connect(_finish_uptodate)
-        w.error.connect(_finish_err)
-        w.start()
-
 
     # ──────────────────────────────────────────────────────────────────────
     # Small helpers
@@ -572,7 +370,6 @@ exit
         new_dir = Path(parent) / slug
 
         if new_dir.exists():
-            # Nếu đã tồn tại: hỏi có dùng luôn không (chỉ tiếp tục nếu trống)
             if any(new_dir.iterdir()):
                 QMessageBox.warning(self, 'Folder exists',
                                     f'The folder already exists and is not empty:\n{new_dir}\n\n'
@@ -606,7 +403,6 @@ exit
             c = repo_commit(new_dir, message=f'Initial snapshot: {name.strip()}')
             self.statusBar().showMessage(f'Initialised repo and committed {c.id[:7]}', 4000)
         except Exception as e:
-            # Repo đã có cũng OK, nhưng cảnh báo việc chưa có checkpoint
             QMessageBox.warning(self, 'Initial commit failed',
                                 f'Repository initialised but initial commit failed.\n\n{e}')
 
@@ -614,7 +410,6 @@ exit
         self._set_working_dir(new_dir)
         QMessageBox.information(self, 'New manuscript',
                                 f'Created manuscript folder and repository:\n{new_dir}')
-
 
     def open_existing(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Select manuscript folder")
@@ -628,8 +423,7 @@ exit
             self._set_working_dir(path)
             return
 
-        # 2) Không có repo tại đây → thử tìm repo con (để bắt case chọn nhầm StudentA/)
-        #    Ưu tiên quét 1 cấp (StudentA/*), sau đó mở rộng nhẹ tới cấp 2 (StudentA/*/*)
+        # 2) Thử tìm repo con (1–2 cấp)
         child_repos = [d for d in path.iterdir() if d.is_dir() and is_repo(d)]
         if not child_repos:
             level2 = []
@@ -645,7 +439,6 @@ exit
             child_repos = level2
 
         if child_repos:
-            # Tìm thấy repo con → cho chọn (nếu chỉ 1 thì mở luôn)
             if len(child_repos) == 1:
                 chosen = child_repos[0]
             else:
@@ -666,7 +459,7 @@ exit
             self._set_working_dir(chosen)
             return
 
-        # 3) Không thấy repo con → hỏi có init repo ở đây không (giữ hành vi cũ)
+        # 3) Không thấy repo con → hỏi init
         resp = QMessageBox.question(
             self,
             "Initialise repository?",
@@ -682,7 +475,6 @@ exit
                 return
             self.statusBar().showMessage("Repository initialised.", 3000)
             self._set_working_dir(path)
-
 
     # ──────────────────────────────────────────────────────────────────────
     # Commit / History / Restore
@@ -1021,7 +813,7 @@ exit
             sources=sources,
         )
 
-        # If no PDF but HTML exists, open HTML externally (viewer sẽ vẫn mở để xem comments)
+        # If no PDF but HTML exists, open HTML externally (viewer vẫn mở để xem comments)
         if not review.pdf_path:
             for cand in ("returned.html", "review.html"):
                 hp = folder / cand
@@ -1033,7 +825,6 @@ exit
                     break
 
         open_review_dialog(self, review)
-
 
     def pull_selected_review(self) -> None:
         if not self.working_dir:
@@ -1137,7 +928,6 @@ exit
                 pass
 
         if not head_commit_id(self.working_dir):
-            # đảm bảo luôn có checkpoint trước khi “đóng gói”
             try:
                 repo_commit(self.working_dir, message='Initial snapshot (auto)')
             except Exception:
