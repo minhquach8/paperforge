@@ -103,7 +103,7 @@ jobs:
 
   release:
     needs: build-windows
-    if: startsWith(github.ref, 'refs/tags/') && github.ref_protected == true
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     environment: production   # sẽ chờ bạn Approve trong Environments
     steps:
