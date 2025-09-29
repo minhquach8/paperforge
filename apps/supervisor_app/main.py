@@ -1,14 +1,8 @@
-# apps/supervisor_app/main.py
 from __future__ import annotations
 
-import html
-import json
-import shutil
-import subprocess
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from PySide6.QtCore import QSettings, QSize, Qt, QTimer
 from PySide6.QtGui import QAction, QBrush, QColor, QFont
@@ -32,26 +26,22 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from apps.supervisor_app.latex_workspace import (
-    LatexWorkspace,
-    load_comments_json,
-    save_comments_json,
-)
-
-# ==== Shared refactor modules ====
 from shared.buildinfo import get_display_version, get_repo
 from shared.config import load_config, save_config
-
-# ✅ đúng module trong repo của bạn
-from shared.detect import detect_manuscript_type
-from shared.events import get_submission_times, returned_event, write_event
-from shared.latex.builder import build_pdf, detect_main_tex
-from shared.latex.diff import build_diff_pdf
-from shared.models import ManuscriptType
-from shared.osutil import open_with_default_app
 from shared.timeutil import iso_to_local_str
 from shared.ui.update_qt import check_for_updates
 from shared.updater import cleanup_legacy_appdata_if_any
+
+from .data import SubmissionInfo
+from .dialogs import prompt_due_datetime
+from .scan import mtype_label, scan_students_root
+from .services import (
+    clear_due_many,
+    open_submission,
+    return_submission,
+    set_due_many,
+    tooltip_for,
+)
 
 APP_NAME = "Paperforge — Supervisor"
 RECENTS_KEY = "supervisor_recent_roots"
@@ -63,187 +53,22 @@ STATUS_COLOURS = {
     "Returned": ("#E6F4EA", "#0F6D31"),
 }
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers (local)
-# ─────────────────────────────────────────────────────────────────────────────
-def submission_status(manuscript_root: Path, submission_id: str) -> str:
-    reviews_dir = manuscript_root / "reviews" / submission_id
-    if (
-        (reviews_dir / "returned.docx").exists()
-        or (reviews_dir / "returned.doc").exists()
-        or (reviews_dir / "returned.html").exists()
-    ):
-        return "Returned"
-    if (
-        (reviews_dir / "working.docx").exists()
-        or (reviews_dir / "working.doc").exists()
-        or (reviews_dir / "review.html").exists()
-        or (reviews_dir / "compiled.pdf").exists()
-        or (reviews_dir / "compiled_diff.pdf").exists()
-    ):
-        return "In review"
-    return "New"
-
-
-def _mtype_label(t: ManuscriptType) -> str:
-    return "Word" if t == ManuscriptType.DOCX else "LaTeX"
-
-
-def _mtype_key(t: ManuscriptType) -> str:
-    """Key nhất quán để so sánh nội bộ nếu cần."""
-    return "docx" if t == ManuscriptType.DOCX else "latex"
-
-
-def write_latex_review_html(
-    dst: Path,
-    title: str,
-    has_pdf: bool,
-    pdf_path: Optional[Path],
-    build_log: str,
-    payload: Path,
-    comments: Optional[dict] = None,
-) -> None:
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    log_escaped = html.escape(build_log or "", quote=False)
-    tex_files = "\n".join(
-        f"<li>{html.escape(str(p.relative_to(payload)))}</li>"
-        for p in sorted(payload.rglob("*.tex"))
-    )
-    pdf_block = ""
-    if has_pdf and pdf_path and pdf_path.exists():
-        pdf_rel = html.escape(pdf_path.name)
-        pdf_block = f"""
-        <p><a href="{pdf_rel}">Open {pdf_rel}</a></p>
-        <embed src="{pdf_rel}" type="application/pdf" width="100%" height="800px"/>
-        """
-
-    comments_block = ""
-    if comments:
-        general = html.escape(comments.get("general", "") or "")
-        items_html = ""
-        for it in comments.get("items", []):
-            file_ = html.escape(str(it.get("file", "")))
-            ls = it.get("line_start", it.get("line", ""))
-            le = it.get("line_end", ls)
-            rng = f"{ls}-{le}" if (ls and le and ls != le) else f"{ls}"
-            text_ = html.escape(str(it.get("text", "")))
-            items_html += f"<li><code>{file_}:{rng}</code> — {text_}</li>\n"
-        comments_block = f"""
-        <details open>
-          <summary><strong>Comments</strong></summary>
-          <h4>General notes</h4>
-          <pre>{general}</pre>
-          <h4>Itemised</h4>
-          <ul>
-            {items_html}
-          </ul>
-        </details>
-        """
-
-    html_text = f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <title>LaTeX Review – {html.escape(title)}</title>
-  <style>
-    body {{ font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }}
-    h1 {{ margin-bottom: 8px; }}
-    code, pre {{ background: #f5f5f5; padding: 8px; border-radius: 6px; }}
-    details {{ margin-top: 16px; }}
-  </style>
-</head>
-<body>
-  <h1>LaTeX Review — {html.escape(title)}</h1>
-  {pdf_block}
-  {comments_block}
-  <details>
-    <summary><strong>Build log</strong></summary>
-    <pre>{log_escaped}</pre>
-  </details>
-  <details>
-    <summary><strong>Source files (.tex)</strong></summary>
-    <ul>
-      {tex_files}
-    </ul>
-  </details>
-  <p><em>Generated by Supervisor app.</em></p>
-</body>
-</html>
-"""
-    dst.write_text(html_text, encoding="utf-8")
-
-
-def last_review_edit_iso(manuscript_root: Path, submission_id: str) -> Optional[str]:
-    rdir = manuscript_root / "reviews" / submission_id
-    if not rdir.exists():
-        return None
-
-    mtimes: list[float] = []
-
-    def _add(p: Path) -> None:
-        if p.exists():
-            try:
-                mtimes.append(p.stat().st_mtime)
-            except Exception:
-                pass
-
-    for name in (
-        "working.docx",
-        "working.doc",
-        "returned.docx",
-        "returned.doc",
-        "review.html",
-        "returned.html",
-        "compiled.pdf",
-        "compiled_diff.pdf",
-        "comments.json",
-    ):
-        _add(rdir / name)
-
-    for sub in ("worktree", "diff"):
-        d = rdir / sub
-        if d.exists():
-            for p in d.rglob("*"):
-                if p.is_file():
-                    _add(p)
-
-    if not mtimes:
-        return None
-
-    latest = max(mtimes)
-    return (
-        datetime.fromtimestamp(latest, tz=timezone.utc)
-        .isoformat(timespec="minutes")
-        .replace("+00:00", "Z")
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Main window
-# ─────────────────────────────────────────────────────────────────────────────
 class SupervisorWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(APP_NAME)
         self.resize(1300, 860)
 
-        central = QWidget(self)
-        root = QVBoxLayout(central)
+        central = QWidget(self); root = QVBoxLayout(central)
 
         # Toolbar
         tb = QToolBar("Quick actions", self)
         tb.setIconSize(QSize(18, 18))
         tb.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self.addToolBar(tb)
-
         def _act(icon, text, slot, checkable=False):
             a = QAction(self.style().standardIcon(icon), text, self)
-            a.setCheckable(checkable)
-            a.triggered.connect(slot)
-            tb.addAction(a)
-            return a
-
+            a.setCheckable(checkable); a.triggered.connect(slot); tb.addAction(a); return a
         _act(QStyle.SP_DirOpenIcon, "Choose Students’ Root…", self.choose_root)
         _act(QStyle.SP_BrowserReload, "Scan", self.scan_root)
         tb.addSeparator()
@@ -252,56 +77,27 @@ class SupervisorWindow(QMainWindow):
         tb.addSeparator()
         _act(QStyle.SP_DialogResetButton, "Clear filters", self._clear_filters)
         tb.addSeparator()
-        self.act_autorescan = _act(
-            QStyle.SP_BrowserReload, "Auto-rescan", self._toggle_autorescan, checkable=True
-        )
+        self.act_autorescan = _act(QStyle.SP_BrowserReload, "Auto-rescan", self._toggle_autorescan, checkable=True)
         tb.addSeparator()
-        self.act_check_update = _act(
-            QStyle.SP_BrowserReload, "Check for updates…", self._check_updates
-        )
+        _act(QStyle.SP_BrowserReload, "Check for updates…", self._check_updates)
 
-        # Current root label
-        self.lbl_root = QLabel("Students’ Root: (none)", self)
-        self.lbl_root.setStyleSheet("color:#444;")
-        self.lbl_root.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        root.addWidget(self.lbl_root)
-
-        # Recent roots row
-        recent_row = QHBoxLayout()
-        recent_row.addWidget(QLabel("Recent:"))
-        self.cb_recent = QComboBox(self)
-        self.cb_recent.setEditable(False)
-        self.btn_use_recent = QPushButton("Open")
-        self.btn_clear_recent = QPushButton("Clear")
-        self.btn_use_recent.clicked.connect(self._use_selected_recent)
-        self.btn_clear_recent.clicked.connect(self._clear_recents)
+        # Labels + recents
+        self.lbl_root = QLabel("Students’ Root: (none)", self); self.lbl_root.setStyleSheet("color:#444;")
+        self.lbl_root.setTextInteractionFlags(Qt.TextSelectableByMouse); root.addWidget(self.lbl_root)
+        row = QHBoxLayout(); row.addWidget(QLabel("Recent:"))
+        self.cb_recent = QComboBox(self); self.btn_use_recent = QPushButton("Open"); self.btn_clear_recent = QPushButton("Clear")
+        self.btn_use_recent.clicked.connect(self._use_selected_recent); self.btn_clear_recent.clicked.connect(self._clear_recents)
         self.cb_recent.activated.connect(lambda _ix: self._use_selected_recent())
-        recent_row.addWidget(self.cb_recent, stretch=1)
-        recent_row.addWidget(self.btn_use_recent)
-        recent_row.addWidget(self.btn_clear_recent)
-        root.addLayout(recent_row)
+        row.addWidget(self.cb_recent, 1); row.addWidget(self.btn_use_recent); row.addWidget(self.btn_clear_recent); root.addLayout(row)
 
         # Filters
         filters = QHBoxLayout()
         filters.addWidget(QLabel("Search:"))
-        self.ed_search = QLineEdit(self)
-        self.ed_search.setPlaceholderText("Student / Manuscript / Journal / Submission ID")
-        self.ed_search.setClearButtonEnabled(True)
-        self.ed_search.textChanged.connect(self.scan_root)
-        filters.addWidget(self.ed_search, stretch=1)
-
-        filters.addWidget(QLabel("Status:"))
-        self.cb_status = QComboBox(self)
-        self.cb_status.addItems(["All", "New", "In review", "Returned"])
-        self.cb_status.currentIndexChanged.connect(self.scan_root)
-        filters.addWidget(self.cb_status)
-
-        filters.addWidget(QLabel("Type:"))
-        self.cb_type = QComboBox(self)
-        self.cb_type.addItems(["All", "Word", "LaTeX"])
-        self.cb_type.currentIndexChanged.connect(self.scan_root)
-        filters.addWidget(self.cb_type)
-
+        self.ed_search = QLineEdit(self); self.ed_search.setPlaceholderText("Student / Manuscript / Journal / Submission ID")
+        self.ed_search.setClearButtonEnabled(True); self.ed_search.textChanged.connect(self.scan_root)
+        filters.addWidget(self.ed_search, 1)
+        filters.addWidget(QLabel("Status:")); self.cb_status = QComboBox(self); self.cb_status.addItems(["All","New","In review","Returned"]); self.cb_status.currentIndexChanged.connect(self.scan_root); filters.addWidget(self.cb_status)
+        filters.addWidget(QLabel("Type:")); self.cb_type = QComboBox(self); self.cb_type.addItems(["All","Word","LaTeX"]); self.cb_type.currentIndexChanged.connect(self.scan_root); filters.addWidget(self.cb_type)
         root.addLayout(filters)
 
         # Legend
@@ -309,590 +105,269 @@ class SupervisorWindow(QMainWindow):
             "Legend: "
             '<span style="background:#E8F0FE;border:1px solid #9EB7F6;padding:2px 8px;border-radius:6px;">New</span> '
             '<span style="background:#FFF8E1;border:1px solid #E7D390;padding:2px 8px;border-radius:6px;">In review</span> '
-            '<span style="background:#E6F4EA;border:1px solid #9CD3B0;padding:2px 8px;border-radius:6px;">Returned</span>'
-        )
-        legend.setStyleSheet("color:#444;")
-        root.addWidget(legend)
+            '<span style="background:#E6F4EA;border:1px solid #9CD3B0;padding:2px 8px;border-radius:6px;">Returned</span> '
+            '<span style="background:#FDE7E9;border:1px solid #F3A6AE;color:#B00020;padding:2px 8px;border-radius:6px;">Overdue</span>')
+        legend.setStyleSheet("color:#444;"); root.addWidget(legend)
 
         # Tree
         self.tree = QTreeWidget(self)
-        self.tree.setColumnCount(8)
-        self.tree.setHeaderLabels(
-            [
-                "Student",
-                "Manuscript",
-                "Journal",
-                "Submission",
-                "Type",
-                "Status",
-                "When",
-                "Last Edit",
-            ]
-        )
+        self.tree.setColumnCount(9)
+        self.tree.setHeaderLabels(["Student","Manuscript","Journal","Submission","Type","Status","When","Due","Last Edit"])
         self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.tree.setUniformRowHeights(True)
-        self.tree.itemDoubleClicked.connect(self._open_item)
         self.tree.setAlternatingRowColors(True)
-        self.tree.setSortingEnabled(True)
-        self.tree.sortByColumn(0, Qt.AscendingOrder)
-        self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.tree.customContextMenuRequested.connect(self._show_tree_menu)
-        root.addWidget(self.tree, stretch=1)
+        self.tree.setSortingEnabled(True); self.tree.sortByColumn(0, Qt.AscendingOrder)
+        self.tree.setContextMenuPolicy(Qt.CustomContextMenu); self.tree.customContextMenuRequested.connect(self._show_tree_menu)
+        self.tree.itemDoubleClicked.connect(self._open_item)
+        root.addWidget(self.tree, 1)
 
         # Action buttons
         actions = QHBoxLayout()
-        self.btn_open = QPushButton("Open")
-        self.btn_notes = QPushButton("Review notes…")
-        self.btn_return = QPushButton("Return selected")
-        self.btn_open.clicked.connect(self._open_selected)
-        self.btn_notes.clicked.connect(self._open_notes_dialog)
-        self.btn_return.clicked.connect(self._return_selected_batch)
-        actions.addWidget(self.btn_open)
-        actions.addWidget(self.btn_notes)
-        actions.addWidget(self.btn_return)
-        root.addLayout(actions)
+        self.btn_open = QPushButton("Open"); self.btn_notes = QPushButton("Review notes…"); self.btn_return = QPushButton("Return selected")
+        self.btn_open.clicked.connect(self._open_selected); self.btn_notes.clicked.connect(self._open_notes_dialog); self.btn_return.clicked.connect(self._return_selected_batch)
+        actions.addWidget(self.btn_open); actions.addWidget(self.btn_notes); actions.addWidget(self.btn_return); root.addLayout(actions)
+
+        # Footer
+        credit = QLabel("Made by Minh Quach", self); credit.setStyleSheet("color:#666; padding-left:12px;")
+        self.statusBar().addPermanentWidget(credit)
+        self.lbl_ver = QLabel(f"v{get_display_version()}", self); self.lbl_ver.setStyleSheet("color:#666; padding-left:12px;")
+        self.statusBar().addPermanentWidget(self.lbl_ver)
 
         self.students_root: Optional[Path] = None
-        self._update_recent_ui()
+        self._settings = QSettings("Paperforge", "Supervisor")
+        if self._settings.value("geometry"): self.restoreGeometry(self._settings.value("geometry"))
+        if self._settings.value("state"): self.restoreState(self._settings.value("state"))
 
-        # Auto-use most recent
+        self._timer = QTimer(self); self._timer.setInterval(90_000); self._timer.timeout.connect(self.scan_root)
+
+        self.setCentralWidget(central)
+        self.statusBar().showMessage("Ready", 3000)
+        cleanup_legacy_appdata_if_any()
+        self._update_recent_ui()
         recents = self._load_recent_roots()
         if recents and Path(recents[0]).exists():
             self._set_students_root(Path(recents[0]), remember=False, autoscan=True)
 
-        # Footer credit + version label (from stamped build file)
-        credit = QLabel("Made by Minh Quach", self)
-        credit.setStyleSheet("color:#666; padding-left:12px;")
-        self.statusBar().addPermanentWidget(credit)
-        self.lbl_ver = QLabel(f"v{get_display_version()}", self)
-        self.lbl_ver.setStyleSheet("color:#666; padding-left:12px;")
-        self.statusBar().addPermanentWidget(self.lbl_ver)
-
-        # Save/restore window state
-        self._settings = QSettings("Paperforge", "Supervisor")
-        if self._settings.value("geometry"):
-            self.restoreGeometry(self._settings.value("geometry"))
-        if self._settings.value("state"):
-            self.restoreState(self._settings.value("state"))
-
-        # Auto-rescan timer
-        self._timer = QTimer(self)
-        self._timer.setInterval(90_000)
-        self._timer.timeout.connect(self.scan_root)
-
-        self.setCentralWidget(central)
-        self.statusBar().showMessage("Ready", 3000)
-
-        # Clean old AppData layout if it ever existed
-        cleanup_legacy_appdata_if_any()
-        # No auto-check update (manual only)
-
-    # ──────────────────────────────────────────────────────────────────────
-    # Updates (manual; shared flow shows its own dialogs)
-    # ──────────────────────────────────────────────────────────────────────
-    def _check_updates(self) -> None:
-        check_for_updates(
-            self,
-            app_id="supervisor",
-            repo=get_repo(),
-            current_version=get_display_version(),
-            app_keyword="Supervisor",
-        )
-
-    # ──────────────────────────────────────────────────────────────────────
-    # Recents & root helpers
-    # ──────────────────────────────────────────────────────────────────────
+    # ── Recents / root
     def _update_root_label(self) -> None:
-        txt = str(self.students_root) if self.students_root else "(none)"
-        self.lbl_root.setText(f"Students’ Root: {txt}")
+        self.lbl_root.setText(f"Students’ Root: {str(self.students_root) if self.students_root else '(none)'}")
 
-    def _set_students_root(self, path: Path, *, remember: bool = True, autoscan: bool = True) -> None:
-        self.students_root = path
-        self._update_root_label()
-        if remember:
-            self._remember_root(path)
-        if autoscan:
-            self.scan_root()
+    def _set_students_root(self, path: Path, *, remember=True, autoscan=True) -> None:
+        self.students_root = path; self._update_root_label()
+        if remember: self._remember_root(path)
+        if autoscan: self.scan_root()
 
     def _load_recent_roots(self) -> list[str]:
-        cfg = load_config()
-        roots = cfg.get(RECENTS_KEY, [])
-        if not isinstance(roots, list):
-            roots = []
-        out: list[str] = []
-        seen = set()
+        cfg = load_config(); roots = cfg.get(RECENTS_KEY, []); 
+        if not isinstance(roots, list): roots = []
+        out, seen = [], set()
         for r in roots:
-            if not isinstance(r, str):
-                continue
-            if r in seen:
-                continue
-            if Path(r).exists():
-                out.append(r)
-                seen.add(r)
+            if isinstance(r, str) and r not in seen and Path(r).exists():
+                out.append(r); seen.add(r)
         return out
 
     def _save_recent_roots(self, roots: list[str]) -> None:
-        cfg = load_config()
-        cfg[RECENTS_KEY] = roots[:MAX_RECENTS]
-        save_config(cfg)
+        cfg = load_config(); cfg[RECENTS_KEY] = roots[:MAX_RECENTS]; save_config(cfg)
 
     def _remember_root(self, path: Path) -> None:
-        s = str(path)
-        roots = self._load_recent_roots()
-        roots = [r for r in roots if r != s]
-        roots.insert(0, s)
-        self._save_recent_roots(roots)
-        self._update_recent_ui()
+        s = str(path); roots = [r for r in self._load_recent_roots() if r != s]; roots.insert(0, s)
+        self._save_recent_roots(roots); self._update_recent_ui()
 
     def _update_recent_ui(self) -> None:
         roots = self._load_recent_roots()
-        self.cb_recent.blockSignals(True)
-        self.cb_recent.clear()
-        for r in roots:
-            self.cb_recent.addItem(r)
+        self.cb_recent.blockSignals(True); self.cb_recent.clear()
+        for r in roots: self.cb_recent.addItem(r)
         self.cb_recent.blockSignals(False)
-        enabled = bool(roots)
-        self.btn_use_recent.setEnabled(enabled)
-        self.btn_clear_recent.setEnabled(enabled)
+        enabled = bool(roots); self.btn_use_recent.setEnabled(enabled); self.btn_clear_recent.setEnabled(enabled)
 
     def _use_selected_recent(self) -> None:
         text = (self.cb_recent.currentText() or "").strip()
-        if not text:
-            return
+        if not text: return
         p = Path(text)
         if not p.exists():
             QMessageBox.warning(self, "Not found", f"Folder no longer exists:\n{text}")
-            roots = [r for r in self._load_recent_roots() if r != text]
-            self._save_recent_roots(roots)
-            self._update_recent_ui()
-            return
+            roots = [r for r in self._load_recent_roots() if r != text]; self._save_recent_roots(roots); self._update_recent_ui(); return
         self._set_students_root(p, remember=True, autoscan=True)
 
     def _clear_recents(self) -> None:
-        self._save_recent_roots([])
-        self._update_recent_ui()
+        self._save_recent_roots([]); self._update_recent_ui()
 
-    # ──────────────────────────────────────────────────────────────────────
-    # Root selection & scanning
-    # ──────────────────────────────────────────────────────────────────────
-    def choose_root(self) -> None:
-        folder = QFileDialog.getExistingDirectory(self, "Select Students’ Root (OneDrive)")
-        if folder:
-            self._set_students_root(Path(folder), remember=True, autoscan=True)
+    # ── Updates
+    def _check_updates(self) -> None:
+        check_for_updates(self, app_id="supervisor", repo=get_repo(), current_version=get_display_version(), app_keyword="Supervisor")
 
-    def _row_passes_filters(
-        self,
-        student: str,
-        title: str,
-        journal: str,
-        sub_id: str,
-        mtype_label: str,  # "Word" | "LaTeX"
-        status: str,
-    ) -> bool:
-        q = self.ed_search.text().strip().lower()
-        if q:
-            if all(q not in s for s in (student.lower(), title.lower(), (journal or "").lower(), sub_id.lower())):
-                return False
-        ty = self.cb_type.currentText()
-        if ty != "All" and mtype_label != ty:
-            return False
-        st = self.cb_status.currentText()
-        if st != "All" and status != st:
-            return False
-        return True
+    # ── Toolbar helpers
+    def _clear_filters(self) -> None:
+        self.ed_search.clear(); self.cb_status.setCurrentIndex(0); self.cb_type.setCurrentIndex(0); self.scan_root()
+
+    def _toggle_autorescan(self, checked: bool) -> None:
+        (self._timer.start() if checked else self._timer.stop())
+        self.statusBar().showMessage(f"Auto-rescan: {'on (every 90s)' if checked else 'off'}", 3000)
+
+    # ── Scan + paint
+    def _apply_status_style(self, item: QTreeWidgetItem, status: str) -> None:
+        colours = STATUS_COLOURS.get(status); 
+        if not colours: return
+        bg_hex, fg_hex = colours; bg = QBrush(QColor(bg_hex)); fg = QBrush(QColor(fg_hex))
+        for col in range(self.tree.columnCount()):
+            item.setBackground(col, bg); item.setForeground(col, fg)
+        f = QFont(self.font()); f.setBold(True); item.setFont(5, f)
 
     def scan_root(self) -> None:
         self.tree.clear()
-        if not self.students_root:
-            return
+        if not self.students_root: return
 
-        root = self.students_root
+        infos = scan_students_root(
+            self.students_root,
+            text_query=self.ed_search.text(),
+            status_filter=self.cb_status.currentText(),
+            type_filter=self.cb_type.currentText(),
+        )
+
+        # group by student
+        by_student: dict[str, list[SubmissionInfo]] = {}
+        for info in infos: by_student.setdefault(info.student, []).append(info)
+
         total = 0
+        for student, rows in sorted(by_student.items()):
+            parent = QTreeWidgetItem([f"{student}   ({len(rows)})"] + [""] * 8)
+            parent.setFirstColumnSpanned(True); self.tree.addTopLevelItem(parent); parent.setExpanded(True)
+            for info in rows:
+                due_label = ""
+                if info.due_iso:
+                    try: due_label = iso_to_local_str(info.due_iso)
+                    except Exception: due_label = info.due_iso
+                    if info.overdue: due_label = f"{due_label}  ⚠ OVERDUE"
 
-        for student_dir in sorted(root.iterdir()):
-            if not student_dir.is_dir():
-                continue
+                it = QTreeWidgetItem([
+                    info.student,
+                    info.manuscript_title,
+                    info.journal,
+                    info.submission_id,
+                    mtype_label(info.mtype),
+                    info.status,
+                    info.when_label,
+                    due_label,
+                    iso_to_local_str(info.last_edit_iso),
+                ])
+                self._apply_status_style(it, info.status)
+                if info.overdue:
+                    it.setForeground(7, QBrush(QColor("#B00020"))); f = QFont(self.font()); f.setBold(True); it.setFont(7, f)
+                # stash SubmissionInfo
+                it.setData(0, Qt.UserRole, info)  # store the whole object
+                tip = tooltip_for(info)
+                if tip:
+                    for col in range(self.tree.columnCount()):
+                        it.setToolTip(col, tip)
+                parent.addChild(it); total += 1
 
-            student_node = QTreeWidgetItem([student_dir.name] + [""] * 7)
-            student_node.setFirstColumnSpanned(True)
-            student_has_rows = False
-            student_count = 0
-
-            for manuscript_dir in sorted(student_dir.iterdir()):
-                if not manuscript_dir.is_dir():
-                    continue
-                submissions = manuscript_dir / "submissions"
-                if not submissions.exists():
-                    continue
-
-                title_default = manuscript_dir.name
-
-                for subdir in sorted(submissions.iterdir()):
-                    if not subdir.is_dir():
-                        continue
-                    manifest_path = subdir / "manifest.json"
-                    if not manifest_path.exists():
-                        continue
-
-                    payload = subdir / "payload"
-
-                    title = title_default
-                    journal = ""
-                    try:
-                        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-                        title = manifest.get("manuscript_title", title)
-                        journal = (manifest.get("journal") or "").strip()
-                    except Exception:
-                        pass
-                    if not journal:
-                        try:
-                            py = json.loads((payload / "paper.yaml").read_text(encoding="utf-8"))
-                            journal = (py.get("journal") or "").strip()
-                        except Exception:
-                            journal = ""
-
-                    # Detect effective mtype from payload
-                    mtype_enum = detect_manuscript_type(payload)
-                    mtype_label = _mtype_label(mtype_enum)
-
-                    status = submission_status(manuscript_dir, subdir.name)
-                    events_dir = manuscript_dir / "events"
-                    sub_ts, ret_ts = get_submission_times(events_dir, subdir.name)
-                    if not sub_ts:
-                        try:
-                            _mf = json.loads(manifest_path.read_text(encoding="utf-8"))
-                            sub_ts = _mf.get("submitted_at")
-                        except Exception:
-                            pass
-
-                    when_label = ""
-                    if ret_ts or sub_ts:
-                        label = "returned" if ret_ts else "submitted"
-                        when_label = f"{label} {iso_to_local_str(ret_ts or sub_ts)}"
-
-                    last_edit_iso = last_review_edit_iso(manuscript_dir, subdir.name)
-                    last_edit_label = iso_to_local_str(last_edit_iso)
-
-                    if not self._row_passes_filters(
-                        student_dir.name, title, journal, subdir.name, mtype_label, status
-                    ):
-                        continue
-
-                    row = QTreeWidgetItem(
-                        [
-                            student_dir.name,
-                            title,
-                            journal,
-                            subdir.name,
-                            mtype_label,
-                            status,
-                            when_label,
-                            last_edit_label,
-                        ]
-                    )
-                    self._apply_status_style(row, status)
-                    row.setData(0, Qt.UserRole, str(subdir))
-
-                    tips = []
-                    if journal:
-                        tips.append(f"Journal:  {journal}")
-                    if sub_ts:
-                        tips.append(f"Submitted: {iso_to_local_str(sub_ts)}")
-                    if ret_ts:
-                        tips.append(f"Returned:  {iso_to_local_str(ret_ts)}")
-                    if last_edit_iso:
-                        tips.append(f"Last edit: {iso_to_local_str(last_edit_iso)}")
-                    if tips:
-                        for col in range(self.tree.columnCount()):
-                            row.setToolTip(col, "\n".join(tips))
-
-                    student_node.addChild(row)
-                    student_has_rows = True
-                    total += 1
-                    student_count += 1
-
-            if student_has_rows:
-                student_node.setText(0, f"{student_dir.name}   ({student_count})")
-                self.tree.addTopLevelItem(student_node)
-                student_node.setExpanded(True)
-
-        for col in (0, 1, 2, 4, 5, 7):
+        for col in (0,1,2,4,5,7,8):
             self.tree.resizeColumnToContents(col)
-
         self.statusBar().showMessage(f"Found {total} submission(s) after filters.", 5000)
 
-    # ──────────────────────────────────────────────────────────────────────
-    # Item helpers
-    # ──────────────────────────────────────────────────────────────────────
-    def _selected_submission_dirs(self) -> list[Path]:
-        out: list[Path] = []
-        for item in self.tree.selectedItems():
-            data = item.data(0, Qt.UserRole)
-            if not data:
-                continue
-            p = Path(str(data))
-            if p.exists():
-                out.append(p)
+    # ── Selection helpers
+    def _selected_infos(self) -> list[SubmissionInfo]:
+        out: list[SubmissionInfo] = []
+        for it in self.tree.selectedItems():
+            data = it.data(0, Qt.UserRole)
+            if isinstance(data, SubmissionInfo):
+                out.append(data)
         return out
 
+    # ── Actions
     def _open_item(self, item: QTreeWidgetItem, _col: int) -> None:
-        if not item.data(0, Qt.UserRole):
-            if item.childCount():
-                self._open_path(Path(item.child(0).data(0, Qt.UserRole)))
-            return
-        self._open_path(Path(item.data(0, Qt.UserRole)))
+        data = item.data(0, Qt.UserRole)
+        if isinstance(data, SubmissionInfo):
+            open_submission(self, data)
+        elif item.childCount():
+            ch = item.child(0).data(0, Qt.UserRole)
+            if isinstance(ch, SubmissionInfo): open_submission(self, ch)
 
     def _open_selected(self) -> None:
-        dirs = self._selected_submission_dirs()
-        if not dirs:
-            return
-        self._open_path(dirs[0])
+        infos = self._selected_infos()
+        if infos: open_submission(self, infos[0])
 
-    def _open_path(self, subdir: Path) -> None:
-        manifest_path = subdir / "manifest.json"
-        if not manifest_path.exists():
-            QMessageBox.warning(self, "Missing manifest", "This submission has no manifest.json.")
-            return
-
-        payload = subdir / "payload"
-        mtype = detect_manuscript_type(payload)
-
-        manuscript_root = subdir.parent.parent
-        reviews_dir = manuscript_root / "reviews" / subdir.name
-        reviews_dir.mkdir(parents=True, exist_ok=True)
-
-        if mtype == ManuscriptType.DOCX:
-            primary = self._find_primary_word(payload)
-            if not primary:
-                QMessageBox.warning(self, "No Word file", "No .docx or .doc file was found in this submission.")
-                return
-            working = reviews_dir / f"working{primary.suffix.lower()}"
-            shutil.copy2(primary, working)
-            open_with_default_app(working)
-            self.statusBar().showMessage("Opened working copy.", 4000)
-            self.scan_root()
-        elif mtype == ManuscriptType.LATEX:
-            dlg = LatexWorkspace(self, submission_dir=subdir, reviews_dir=reviews_dir)
-            dlg.exec()
-            self.scan_root()
-        else:
-            QMessageBox.information(self, "Unknown type", f"Manuscript type: {mtype}")
-
-    def _find_primary_word(self, payload_dir: Path) -> Optional[Path]:
-        for ext in (".docx", ".doc"):
-            for p in sorted(payload_dir.rglob(f"*{ext}")):
-                return p
-        return None
-
-    def _apply_status_style(self, item: QTreeWidgetItem, status: str) -> None:
-        colours = STATUS_COLOURS.get(status)
-        if not colours:
-            return
-        bg_hex, fg_hex = colours
-        bg = QBrush(QColor(bg_hex))
-        fg = QBrush(QColor(fg_hex))
-        for col in range(self.tree.columnCount()):
-            item.setBackground(col, bg)
-            item.setForeground(col, fg)
-        f = QFont(self.font())
-        f.setBold(True)
-        item.setFont(5, f)
-
-    # ──────────────────────────────────────────────────────────────────────
-    # Review notes & Return
-    # ──────────────────────────────────────────────────────────────────────
     def _open_notes_dialog(self) -> None:
-        dirs = self._selected_submission_dirs()
-        if not dirs:
-            return
-        if len(dirs) > 1:
-            QMessageBox.information(self, "Notes", "Please select a single submission to edit notes.")
-            return
-
-        subdir = dirs[0]
-        manuscript_root = subdir.parent.parent
-        reviews_dir = manuscript_root / "reviews" / subdir.name
-        reviews_dir.mkdir(parents=True, exist_ok=True)
-        payload_dir = subdir / "payload"
-
-        if detect_manuscript_type(payload_dir) == ManuscriptType.LATEX:
-            dlg = LatexWorkspace(self, submission_dir=subdir, reviews_dir=reviews_dir)
-            dlg.exec()
-            self.statusBar().showMessage("Workspace closed.", 3000)
-            return
-
-        data = load_comments_json(reviews_dir)
-        from PySide6.QtWidgets import QDialog, QDialogButtonBox, QTextEdit, QVBoxLayout
-
-        d = QDialog(self)
-        d.setWindowTitle("Review notes")
-        lay = QVBoxLayout(d)
-        ed = QTextEdit(d)
-        ed.setPlainText(data.get("general", ""))
-        lay.addWidget(QLabel("General notes:"))
-        lay.addWidget(ed)
-        btns = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel, parent=d)
-        lay.addWidget(btns)
-
-        def _save():
-            data["general"] = ed.toPlainText()
-            save_comments_json(reviews_dir, data)
-            d.accept()
-
-        btns.accepted.connect(_save)
-        btns.rejected.connect(d.reject)
-        d.exec()
-        self.statusBar().showMessage("Comments saved.", 3000)
+        # Word notes dialog đã được quản trị ở LatexWorkspace hoặc Word review;
+        # Ở bản refactor này ta mở submission; người dùng chỉnh trong workspace/Word.
+        self._open_selected()
 
     def _return_selected_batch(self) -> None:
-        dirs = self._selected_submission_dirs()
-        if not dirs:
-            QMessageBox.information(self, "Return", "Please select one or more submissions.")
-            return
-
-        successes = 0
-        failures: list[str] = []
-        for subdir in dirs:
+        infos = self._selected_infos()
+        if not infos:
+            QMessageBox.information(self, "Return", "Please select one or more submissions."); return
+        ok, fail = 0, []
+        for info in infos:
             try:
-                ok = self._return_one(subdir)
-                if ok:
-                    successes += 1
-                else:
-                    failures.append(subdir.name)
+                if return_submission(info): ok += 1
+                else: fail.append(info.submission_id)
             except Exception as e:
-                failures.append(f"{subdir.name} ({e})")
-
+                fail.append(f"{info.submission_id} ({e})")
         self.scan_root()
-        if failures:
-            QMessageBox.warning(
-                self, "Return completed with issues", f"Returned {successes} submission(s).\nFailed: {', '.join(failures)}"
-            )
+        if fail:
+            QMessageBox.warning(self, "Return – partial", f"Returned {ok} submission(s).\nFailed: {', '.join(fail)}")
         else:
-            QMessageBox.information(self, "Returned", f"Returned {successes} submission(s).")
+            QMessageBox.information(self, "Returned", f"Returned {ok} submission(s).")
 
-    def _return_one(self, subdir: Path) -> bool:
-        manuscript_root = subdir.parent.parent
-        events_dir = manuscript_root / "events"
-        reviews_dir = manuscript_root / "reviews" / subdir.name
-        reviews_dir.mkdir(parents=True, exist_ok=True)
-        payload = subdir / "payload"
+    # ── Menu
+    def _show_tree_menu(self, pos) -> None:
+        item = self.tree.itemAt(pos)
+        if not item: return
+        menu = QMenu(self)
+        open_act = menu.addAction("Open")
+        ret_act = menu.addAction("Return selected")
+        update_act = menu.addAction("Check for updates…")
+        due_set_act = menu.addAction("Set expected return date…")
+        due_clear_act = menu.addAction("Clear expected return date")
 
-        # WORD flow
-        working_docx = reviews_dir / "working.docx"
-        working_doc = reviews_dir / "working.doc"
-        if working_docx.exists() or working_doc.exists():
-            working = working_docx if working_docx.exists() else working_doc
-            returned = reviews_dir / f"returned{working.suffix.lower()}"
-            shutil.copy2(working, returned)
-            if not (reviews_dir / "comments.json").exists():
-                save_comments_json(reviews_dir, {"general": "Reviewed in Word", "items": []})
-            write_event(events_dir, returned_event(subdir.name))
-            return True
+        info = item.data(0, Qt.UserRole)
+        view_due_note_act = None
+        if isinstance(info, SubmissionInfo) and (info.due_note or "").strip():
+            view_due_note_act = menu.addAction("View due note…")
 
-        primary_word = None
-        for ext in (".docx", ".doc"):
-            ps = sorted(payload.rglob(f"*{ext}"))
-            if ps:
-                primary_word = ps[0]
-                break
-        if primary_word is not None:
-            returned = reviews_dir / f"returned{primary_word.suffix.lower()}"
-            shutil.copy2(primary_word, returned)
-            if not (reviews_dir / "comments.json").exists():
-                save_comments_json(
-                    reviews_dir, {"general": "Reviewed in Word (from submitted file)", "items": []}
-                )
-            write_event(events_dir, returned_event(subdir.name))
-            return True
+        act = menu.exec_(self.tree.viewport().mapToGlobal(pos))
+        if act == open_act:
+            self._open_item(item, 0)
+        elif act == ret_act:
+            self._return_selected_batch()
+        elif act == update_act:
+            self._check_updates()
+        elif act == due_set_act:
+            infos = self._selected_infos()
+            if not infos: return
+            iso, note = prompt_due_datetime(self)
+            if iso:
+                try:
+                    set_due_many(infos, iso, note, set_by="supervisor")
+                    self.scan_root(); self.statusBar().showMessage("Due date updated.", 3000)
+                except Exception as e:
+                    QMessageBox.warning(self, "Set due failed", str(e))
+        elif act == due_clear_act:
+            infos = self._selected_infos()
+            if infos:
+                try:
+                    clear_due_many(infos); self.scan_root(); self.statusBar().showMessage("Due date cleared.", 3000)
+                except Exception as e:
+                    QMessageBox.warning(self, "Clear due failed", str(e))
+        elif view_due_note_act and act == view_due_note_act and isinstance(info, SubmissionInfo):
+            QMessageBox.information(self, "Due note", info.due_note)
 
-        # LaTeX flow
-        worktree = reviews_dir / "worktree" if (reviews_dir / "worktree").exists() else payload
-        diff_ok, diff_log, diff_pdf = build_diff_pdf(payload, worktree, reviews_dir)
-        pdf_path = diff_pdf
-        if not diff_ok or not (pdf_path and pdf_path.exists()):
-            pdf_path = reviews_dir / "compiled.pdf"
-            if not pdf_path.exists():
-                main_rel = detect_main_tex(worktree)
-                if main_rel:
-                    _ok, _log, _ = build_pdf(worktree, main_rel, pdf_path)
-
-        comments = load_comments_json(reviews_dir)
-        returned_html = reviews_dir / "returned.html"
-        title = manuscript_root.name
-        try:
-            manifest = json.loads((subdir / "manifest.json").read_text(encoding="utf-8"))
-            title = manifest.get("manuscript_title", title)
-        except Exception:
-            pass
-
-        write_latex_review_html(
-            returned_html,
-            title=f"{title} (Returned)",
-            has_pdf=bool(pdf_path and pdf_path.exists()),
-            pdf_path=pdf_path if (pdf_path and pdf_path.exists()) else None,
-            build_log=(diff_log if diff_ok else "(No latexdiff; plain build.)"),
-            payload=payload,
-            comments=comments,
-        )
-        if not (reviews_dir / "comments.json").exists():
-            save_comments_json(reviews_dir, {"general": "", "items": []})
-
-        write_event(events_dir, returned_event(subdir.name))
-        return True
-
-    # Window state + helpers
+    # ── Window state
     def closeEvent(self, ev):
         if hasattr(self, "_settings"):
             self._settings.setValue("geometry", self.saveGeometry())
             self._settings.setValue("state", self.saveState())
         super().closeEvent(ev)
 
-    def _clear_filters(self) -> None:
-        self.ed_search.clear()
-        self.cb_status.setCurrentIndex(0)
-        self.cb_type.setCurrentIndex(0)
-        self.scan_root()
-
-    def _toggle_autorescan(self, checked: bool) -> None:
-        if checked:
-            self._timer.start()
-            self.statusBar().showMessage("Auto-rescan: on (every 90s)", 3000)
-        else:
-            self._timer.stop()
-            self.statusBar().showMessage("Auto-rescan: off", 3000)
-
-    def _show_tree_menu(self, pos) -> None:
-        item = self.tree.itemAt(pos)
-        if not item:
-            return
-        menu = QMenu(self)
-        open_act = menu.addAction("Open")
-        notes_act = menu.addAction("Review notes…")
-        ret_act = menu.addAction("Return selected")
-        update_act = menu.addAction("Check for updates…")
-        act = menu.exec_(self.tree.viewport().mapToGlobal(pos))
-        if act == open_act:
-            if not item.data(0, Qt.UserRole) and item.childCount():
-                self._open_path(Path(item.child(0).data(0, Qt.UserRole)))
-            else:
-                p = item.data(0, Qt.UserRole)
-                if p:
-                    self._open_path(Path(p))
-        elif act == notes_act:
-            item.setSelected(True)
-            self._open_notes_dialog()
-        elif act == ret_act:
-            self._return_selected_batch()
-        elif act == update_act:
-            self._check_updates()
-
+    # ── Root picker
+    def choose_root(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "Select Students’ Root (OneDrive)")
+        if folder: self._set_students_root(Path(folder), remember=True, autoscan=True)
 
 def main() -> None:
     app = QApplication(sys.argv)
-    window = SupervisorWindow()
-    window.show()
+    w = SupervisorWindow(); w.show()
     sys.exit(app.exec())
-
 
 if __name__ == "__main__":
     main()
