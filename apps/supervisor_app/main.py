@@ -26,22 +26,21 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from shared.buildinfo import get_display_version, get_repo
-from shared.config import load_config, save_config
-from shared.timeutil import iso_to_local_str
-from shared.ui.update_qt import check_for_updates
-from shared.updater import cleanup_legacy_appdata_if_any
-
-from .data import SubmissionInfo
-from .dialogs import prompt_due_datetime
-from .scan import mtype_label, scan_students_root
-from .services import (
+from apps.supervisor_app.data import SubmissionInfo
+from apps.supervisor_app.dialogs import prompt_due_datetime
+from apps.supervisor_app.scan import mtype_label, scan_students_root
+from apps.supervisor_app.services import (
     clear_due_many,
     open_submission,
     return_submission,
     set_due_many,
     tooltip_for,
 )
+from shared.buildinfo import get_display_version, get_repo
+from shared.config import load_config, save_config
+from shared.timeutil import iso_to_local_str
+from shared.ui.update_qt import check_for_updates
+from shared.updater import cleanup_legacy_appdata_if_any
 
 APP_NAME = "Paperforge — Supervisor"
 RECENTS_KEY = "supervisor_recent_roots"
