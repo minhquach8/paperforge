@@ -111,9 +111,19 @@ jobs:
           sha256sum Paperforge-*-Portable-win64.zip > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
+      - name: Check minisign password presence
+        env:
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          if [ -z "${MINISIGN_PASSWORD}" ]; then
+            echo "MINISIGN_PASSWORD is NOT set"; exit 1;
+          else
+            echo "MINISIGN_PASSWORD is set (masked)"; 
+          fi
+
       - name: Sign artifacts (minisign)
         env:
-          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}   # nếu khóa không passphrase, có thể bỏ dòng này
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}   # <<< thêm dòng này
         run: |
           set -e
           cd dist
