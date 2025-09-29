@@ -8,4 +8,4 @@ build/
 .pyinstaller/
 .venv/
 .DS_Store
-paperforge_secretkey.txt
+paperforge.key*

@@ -11,23 +11,16 @@ permissions:
 jobs:
   build-windows:
     runs-on: windows-latest
-    defaults:
-      run:
-        shell: pwsh
+    defaults: { run: { shell: pwsh } }
     outputs:
       app_version: ${{ steps.ver.outputs.version }}
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          lfs: true
-          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with: { lfs: true, fetch-depth: 0 }
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
 
       - name: Install deps
         run: |
@@ -44,22 +37,21 @@ jobs:
           { "version": "$ver" }
           "@ | Set-Content shared\paperforge_build.json -Encoding utf8
 
-      - name: Verify build stamp file exists
+      # (tuỳ chọn) ép shared/version.py khớp tag
+      - name: Force version.py to match tag
         run: |
-          if (-not (Test-Path shared\paperforge_build.json)) {
-            Write-Host "Expected file not found: shared\paperforge_build.json"
-            Get-ChildItem -Recurse shared | ForEach-Object { $_.FullName }
-            throw "paperforge_build.json missing"
+          $ver = "${{ github.ref_name }}".TrimStart('v')
+          if (Test-Path shared\version.py) {
+            (Get-Content shared\version.py -Raw) `
+              -replace 'APP_VERSION\s*=\s*".*?"', "APP_VERSION = `"$ver`"" `
+            | Set-Content shared\version.py -Encoding utf8
           }
 
-      - name: Read app version (from shared/version.py if present)
+      - name: Read app version
         id: ver
         run: |
-          try {
-            $v = python -c "from shared.version import APP_VERSION; print(APP_VERSION)"
-          } catch {
-            $v = "$env:PAPERFORGE_VERSION"
-          }
+          try { $v = python -c "from shared.version import APP_VERSION; print(APP_VERSION)" }
+          catch { $v = "$env:PAPERFORGE_VERSION" }
           echo "version=$v" >> $env:GITHUB_OUTPUT
 
       - name: Build Student (PyInstaller)
@@ -68,34 +60,20 @@ jobs:
       - name: Build Supervisor (PyInstaller)
         run: pyinstaller -y packaging\win_supervisor.spec
 
-      - name: Show dist tree (debug)
-        run: |
-          Write-Host "== dist =="
-          Get-ChildItem -Recurse -Force dist | ForEach-Object { $_.FullName }
-
       - name: Zip portable bundles
         run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-
           $superDir = Get-ChildItem -Path dist -Directory | Where-Object { $_.Name -match 'Supervisor' } | Select-Object -First 1
           if (-not $superDir) { throw "Không tìm thấy thư mục Supervisor trong dist." }
-          $superZip = "dist\Paperforge-Supervisor-Portable-win64.zip"
-          if (Test-Path $superZip) { Remove-Item $superZip -Force }
-          Compress-Archive -Path "$($superDir.FullName)\*" -DestinationPath $superZip -Force
+          Compress-Archive -Path "$($superDir.FullName)\*" -DestinationPath "dist\Paperforge-Supervisor-Portable-win64.zip" -Force
 
           $studDir = Get-ChildItem -Path dist -Directory | Where-Object { $_.Name -match 'Student' } | Select-Object -First 1
           if (-not $studDir) { throw "Không tìm thấy thư mục Student trong dist." }
-          $studZip = "dist\Paperforge-Student-Portable-win64.zip"
-          if (Test-Path $studZip) { Remove-Item $studZip -Force }
-          Compress-Archive -Path "$($studDir.FullName)\*" -DestinationPath $studZip -Force
-
-          Write-Host "Zipped:"
-          Get-Item dist\*.zip | ForEach-Object { $_.FullName }
+          Compress-Archive -Path "$($studDir.FullName)\*" -DestinationPath "dist\Paperforge-Student-Portable-win64.zip" -Force
 
       - name: Upload portable artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: paperforge-portable-${{ steps.ver.outputs.version }}
+          name: paperforge-portable-${{ github.ref_name }}   # v1.x.y
           path: |
             dist/Paperforge-Supervisor-Portable-win64.zip
             dist/Paperforge-Student-Portable-win64.zip
@@ -105,12 +83,11 @@ jobs:
     needs: build-windows
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
-    environment: production   # sẽ chờ bạn Approve trong Environments
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
-          name: paperforge-portable-${{ needs.build-windows.outputs.app_version }}
+          name: paperforge-portable-${{ github.ref_name }}
           path: dist
 
       - name: Install minisign
@@ -125,15 +102,20 @@ jobs:
           test -n "$MINISIGN_SECRET_B64" || (echo "MINISIGN_SECRET_B64 missing"; exit 1)
           echo "$MINISIGN_SECRET_B64" | base64 -d > minisign.key
           chmod 600 minisign.key
+          ls -l minisign.key
 
       - name: Generate checksums
         run: |
+          set -e
           cd dist
           sha256sum Paperforge-*-Portable-win64.zip > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Sign artifacts (minisign)
+        env:
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}   # nếu khóa không passphrase, có thể bỏ dòng này
         run: |
+          set -e
           cd dist
           minisign -S -s ../minisign.key -m Paperforge-Supervisor-Portable-win64.zip -x Paperforge-Supervisor-Portable-win64.zip.minisig -H -c "${{ github.ref_name }} supervisor"
           minisign -S -s ../minisign.key -m Paperforge-Student-Portable-win64.zip   -x Paperforge-Student-Portable-win64.zip.minisig   -H -c "${{ github.ref_name }} student"
