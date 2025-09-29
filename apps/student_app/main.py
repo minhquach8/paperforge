@@ -41,6 +41,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from apps.student_app.review_viewer import ReviewData, ReviewItem, open_review_dialog
+
 # Repo core
 from paperrepo.repo import commit as repo_commit
 from paperrepo.repo import head_commit_id, init_repo, is_repo
@@ -54,6 +56,7 @@ from shared.config import (
     remember_defaults,
     remember_mapping,
 )
+from shared.detect import detect_manuscript_type  # ✅ đúng module
 from shared.events import (
     get_submission_times,
     new_submission_event,
@@ -61,6 +64,7 @@ from shared.events import (
     write_event,
 )
 from shared.models import Manifest, ManuscriptType
+from shared.osutil import open_with_default_app  # ✅ dùng shared.osutil
 from shared.paths import manuscript_root, manuscript_subdirs, slugify
 from shared.timeutil import iso_to_local_str
 
@@ -108,35 +112,6 @@ def write_minimal_paper_yaml(dst: Path, title: str, journal: str = "") -> None:
     (dst / "paper.yaml").write_text(
         json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-
-
-def open_with_default_app(path: Path) -> None:
-    """Open a file with the system default application."""
-    if sys.platform.startswith("win"):
-        import os
-        os.startfile(str(path))  # type: ignore[attr-defined]
-    elif sys.platform == "darwin":
-        subprocess.run(["open", str(path)], check=False)
-    else:
-        subprocess.run(["xdg-open", str(path)], check=False)
-
-
-def detect_manuscript_type(root: Path) -> ManuscriptType:
-    """
-    Robustly detect manuscript type by scanning the payload.
-    Treat both .docx and .doc as 'DOCX' (Word flow).
-    """
-    has_docx = any(p.is_file() and p.suffix.lower() == ".docx" for p in root.rglob("*"))
-    has_doc = any(p.is_file() and p.suffix.lower() == ".doc" for p in root.rglob("*"))
-    has_tex = any(p.is_file() and p.suffix.lower() == ".tex" for p in root.rglob("*"))
-    has_word = has_docx or has_doc
-    if has_word and not has_tex:
-        return ManuscriptType.DOCX
-    if has_tex and not has_word:
-        return ManuscriptType.LATEX
-    if has_word and has_tex:
-        return ManuscriptType.DOCX  # prefer Word for MVP
-    return ManuscriptType.DOCX
 
 
 class UpdateWorker(QThread):
@@ -580,55 +555,134 @@ exit
     # Create / Open
     # ──────────────────────────────────────────────────────────────────────
     def create_new(self) -> None:
-        parent = QFileDialog.getExistingDirectory(
-            self, "Choose a parent directory for the manuscript"
-        )
+        # Chọn parent
+        parent = QFileDialog.getExistingDirectory(self, 'Choose a parent directory for the manuscript')
         if not parent:
             return
-        name, ok = QInputDialog.getText(
-            self, "Manuscript name", "Enter a manuscript name (e.g. Paper 1):"
-        )
+
+        # Nhập tên + journal
+        name, ok = QInputDialog.getText(self, 'Manuscript name', 'Enter a manuscript name (e.g. Paper 1):')
         if not ok or not name.strip():
             return
-        journal, ok = QInputDialog.getText(
-            self, "Target journal (optional)", "Enter target journal (optional):"
-        )
+        journal, ok = QInputDialog.getText(self, 'Target journal (optional)', 'Enter target journal (optional):')
         if not ok:
             return
 
         slug = slugify(name)
         new_dir = Path(parent) / slug
+
         if new_dir.exists():
-            QMessageBox.warning(
-                self, "Folder exists", f"The folder already exists:\n{new_dir}"
-            )
+            # Nếu đã tồn tại: hỏi có dùng luôn không (chỉ tiếp tục nếu trống)
+            if any(new_dir.iterdir()):
+                QMessageBox.warning(self, 'Folder exists',
+                                    f'The folder already exists and is not empty:\n{new_dir}\n\n'
+                                    'Please choose another name or remove the folder.')
+                return
+        else:
+            new_dir.mkdir(parents=True, exist_ok=True)
+
+        # Ghi metadata sớm
+        try:
+            write_minimal_paper_yaml(new_dir, title=name.strip(), journal=journal.strip())
+        except Exception as e:
+            QMessageBox.critical(self, 'Error writing paper.yaml', str(e))
             return
 
-        new_dir.mkdir(parents=True, exist_ok=True)
-        write_minimal_paper_yaml(new_dir, title=name.strip(), journal=journal.strip())
-        init_repo(new_dir)
-        repo_commit(new_dir, message="Initial snapshot (auto)")
+        # KHỞI TẠO REPO – KHÔNG NUỐT LỖI
+        try:
+            init_repo(new_dir)
+        except Exception as e:
+            QMessageBox.critical(self, 'Init repository failed',
+                                f'Could not create repository at:\n{new_dir}\n\n{e}')
+            return
 
-        self.statusBar().showMessage("Initialised new manuscript and repo.", 4000)
+        if not is_repo(new_dir):
+            QMessageBox.critical(self, 'Repository not found',
+                                f'Init succeeded but repo not detected at:\n{new_dir}')
+            return
+
+        # Commit đầu tiên
+        try:
+            c = repo_commit(new_dir, message=f'Initial snapshot: {name.strip()}')
+            self.statusBar().showMessage(f'Initialised repo and committed {c.id[:7]}', 4000)
+        except Exception as e:
+            # Repo đã có cũng OK, nhưng cảnh báo việc chưa có checkpoint
+            QMessageBox.warning(self, 'Initial commit failed',
+                                f'Repository initialised but initial commit failed.\n\n{e}')
+
+        # Cập nhật UI + bật luôn thư mục làm việc
         self._set_working_dir(new_dir)
+        QMessageBox.information(self, 'New manuscript',
+                                f'Created manuscript folder and repository:\n{new_dir}')
+
 
     def open_existing(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Select manuscript folder")
         if not folder:
             return
         path = Path(folder)
-        if not is_repo(path):
-            resp = QMessageBox.question(
-                self,
-                "Initialise repository?",
-                "This folder has no repository (.paperrepo). Do you want to initialise it now?",
-                QMessageBox.Yes | QMessageBox.No,
-            )
-            if resp == QMessageBox.Yes:
+
+        # 1) Trường hợp chọn đúng thư mục manuscript
+        if is_repo(path):
+            self.statusBar().showMessage("Manuscript ready.", 3000)
+            self._set_working_dir(path)
+            return
+
+        # 2) Không có repo tại đây → thử tìm repo con (để bắt case chọn nhầm StudentA/)
+        #    Ưu tiên quét 1 cấp (StudentA/*), sau đó mở rộng nhẹ tới cấp 2 (StudentA/*/*)
+        child_repos = [d for d in path.iterdir() if d.is_dir() and is_repo(d)]
+        if not child_repos:
+            level2 = []
+            for d1 in path.iterdir():
+                if not d1.is_dir():
+                    continue
+                try:
+                    for d2 in d1.iterdir():
+                        if d2.is_dir() and is_repo(d2):
+                            level2.append(d2)
+                except Exception:
+                    pass
+            child_repos = level2
+
+        if child_repos:
+            # Tìm thấy repo con → cho chọn (nếu chỉ 1 thì mở luôn)
+            if len(child_repos) == 1:
+                chosen = child_repos[0]
+            else:
+                names = [str(p) for p in child_repos]
+                chosen_str, ok = QInputDialog.getItem(
+                    self,
+                    "Choose manuscript",
+                    "This folder has no repository.\nSelect a manuscript inside:",
+                    names,
+                    0,
+                    False,
+                )
+                if not ok or not chosen_str:
+                    return
+                chosen = Path(chosen_str)
+
+            self.statusBar().showMessage(f"Opening nested manuscript: {chosen}", 4000)
+            self._set_working_dir(chosen)
+            return
+
+        # 3) Không thấy repo con → hỏi có init repo ở đây không (giữ hành vi cũ)
+        resp = QMessageBox.question(
+            self,
+            "Initialise repository?",
+            "This folder has no repository (.paperrepo). Do you want to initialise it now?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if resp == QMessageBox.Yes:
+            try:
                 init_repo(path)
                 repo_commit(path, message="Initial snapshot (auto)")
-        self.statusBar().showMessage("Manuscript ready.", 3000)
-        self._set_working_dir(path)
+            except Exception as e:
+                QMessageBox.critical(self, "Init repository failed", str(e))
+                return
+            self.statusBar().showMessage("Repository initialised.", 3000)
+            self._set_working_dir(path)
+
 
     # ──────────────────────────────────────────────────────────────────────
     # Commit / History / Restore
@@ -891,11 +945,95 @@ exit
         items = self.inbox_list.selectedItems()
         if not items:
             return
-        path = Path(items[0].data(Qt.UserRole))
-        if not path.exists():
-            QMessageBox.warning(self, "Missing file", f"Review file not found:\n{path}")
+
+        sel_path = Path(items[0].data(Qt.UserRole))
+        sub_id = items[0].data(Qt.UserRole + 1) or "unknown"
+        cjson = Path(items[0].data(Qt.UserRole + 2) or "")
+
+        if not sel_path.exists():
+            QMessageBox.warning(self, "Missing file", f"Review file not found:\n{sel_path}")
             return
-        open_with_default_app(path)
+
+        folder = sel_path.parent
+
+        # --- pick primary PDF (prefer *_diff.pdf) ---
+        def _first(glob_pat: str) -> Optional[str]:
+            for p in sorted(folder.glob(glob_pat)):
+                return str(p)
+            return None
+
+        pdf_path = None
+        diff_pdf = _first("*diff*.pdf")
+        if sel_path.suffix.lower() == ".pdf":
+            pdf_path = str(sel_path)
+        elif diff_pdf:
+            pdf_path = diff_pdf
+        else:
+            pdf_path = _first("*.pdf")
+
+        # --- load comments.json -> general / comments / itemised ---
+        general_notes = ""
+        comments_list = []
+        item_objs: list[ReviewItem] = []
+
+        if cjson.exists():
+            try:
+                d = json.loads(cjson.read_text(encoding="utf-8"))
+                general_notes = d.get("general") or ""
+                comments_list = d.get("comments") or []
+                for it in (d.get("items") or []):
+                    f = it.get("file", "")
+                    ls = it.get("line_start", it.get("line", ""))
+                    le = it.get("line_end", ls)
+                    msg = it.get("text", "")
+                    linestr = str(ls) if ls == le else f"{ls}-{le}"
+                    item_objs.append(ReviewItem(file=f, lines=linestr, message=msg))
+            except Exception as e:
+                general_notes = f"(Failed to parse comments.json: {e})"
+
+        # --- build log (best-effort) ---
+        build_log = ""
+        for cand in ("build.log", "latexmk.log", "pdflatex.log", "log.txt"):
+            p = folder / cand
+            if p.exists():
+                try:
+                    build_log = p.read_text(encoding="utf-8", errors="ignore")
+                except Exception:
+                    pass
+                break
+
+        # --- sources: list .tex (limited) ---
+        sources: list[tuple[str, str]] = []
+        texs = list(folder.glob("*.tex")) or list(folder.glob("**/*.tex"))
+        for p in texs[:30]:
+            sources.append((p.name, str(p)))
+
+        # --- build ReviewData and open dialog ---
+        review = ReviewData(
+            title=f"Review — submission {sub_id}",
+            status="Returned" if "returned" in sel_path.name.lower() else "Preview",
+            pdf_path=pdf_path,
+            diff_pdf_path=diff_pdf,
+            general_notes=general_notes,
+            comments=comments_list,
+            items=item_objs,
+            build_log=build_log,
+            sources=sources,
+        )
+
+        # If no PDF but HTML exists, open HTML externally (viewer sẽ vẫn mở để xem comments)
+        if not review.pdf_path:
+            for cand in ("returned.html", "review.html"):
+                hp = folder / cand
+                if hp.exists():
+                    try:
+                        open_with_default_app(hp)
+                    except Exception:
+                        pass
+                    break
+
+        open_review_dialog(self, review)
+
 
     def pull_selected_review(self) -> None:
         if not self.working_dir:
@@ -992,6 +1130,19 @@ exit
     # Submit
     # ──────────────────────────────────────────────────────────────────────
     def submit_to_supervisor(self) -> None:
+        if not is_repo(self.working_dir):
+            try:
+                init_repo(self.working_dir)
+            except Exception:
+                pass
+
+        if not head_commit_id(self.working_dir):
+            # đảm bảo luôn có checkpoint trước khi “đóng gói”
+            try:
+                repo_commit(self.working_dir, message='Initial snapshot (auto)')
+            except Exception:
+                pass
+
         if not self.working_dir:
             QMessageBox.warning(
                 self, "No manuscript", "Please select or create a manuscript folder first."
