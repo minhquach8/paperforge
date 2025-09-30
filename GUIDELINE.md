@@ -1,5 +1,4 @@
 # Paperforge — User Guide (Student & Supervisor)
----
 
 ## Contents
 
@@ -31,6 +30,7 @@
     - [What happens if an update is tampered with?](#what-happens-if-an-update-is-tampered-with)
     - [Can I use the apps without Internet?](#can-i-use-the-apps-without-internet)
     - [Where are my preferences stored?](#where-are-my-preferences-stored)
+    - [Why do I see “Access is denied” on return?](#why-do-i-see-access-is-denied-on-return)
   - [Good practice \& tips](#good-practice--tips)
 
 ---
@@ -39,29 +39,28 @@
 
 * **Windows 10 / 11 (64-bit)**.
 * A user-writable folder (e.g. `C:\Users\<you>\Paperforge\`).
-* For LaTeX diff (optional): **TeX Live** or **MiKTeX** with `latexdiff` in `PATH`.
-* A working **OneDrive** connection for student ↔ supervisor exchange.
+* A working **OneDrive** connection for Student ↔ Supervisor exchange.
+* To open Word documents: **Microsoft Word** (recommended) or **LibreOffice**.
+* *(Optional, for nicer LaTeX diffs)* **TeX Live** or **MiKTeX** with `latexdiff` in `PATH`.
 
 ---
 
 ## Installation (portable builds)
 
-1. Download the latest portable zip(s):
+1. Download the latest portable zips:
 
    * `Paperforge-Student-Portable-win64.zip`
    * `Paperforge-Supervisor-Portable-win64.zip`
-2. **Extract** each zip to a folder you control, e.g.:
+2. **Extract** each zip into a folder you control, e.g.
 
    ```
    C:\Users\<you>\Paperforge\Student\
    C:\Users\<you>\Paperforge\Supervisor\
    ```
-3. Run the app:
+3. Run `Paperforge-Student.exe` or `Paperforge-Supervisor.exe`.
+4. No system-wide installation is performed; the app runs **in place** from the extracted folder.
 
-   * `Paperforge-Student.exe` or `Paperforge-Supervisor.exe`.
-4. No system-wide installation is performed. The app runs **in-place** from the folder you extracted.
-
-> **Note:** When **updating**, the app replaces itself **in the same folder**; it does *not* relocate into AppData. See [Updates & security](#updates--security).
+> **Note:** During updates, the app replaces itself **in the same folder**; it does **not** move into AppData. See [Updates & security](#updates--security).
 
 ---
 
@@ -69,7 +68,7 @@
 
 ### Folder layout on disk
 
-Paperforge uses a simple folder structure on your shared **Students’ Root** (typically a OneDrive folder):
+Paperforge uses a simple structure under the shared **Students’ Root** (typically a OneDrive folder):
 
 ```
 Students’ Root/
@@ -77,11 +76,11 @@ Students’ Root/
     <manuscript-slug>/
       submissions/
         <YYYYMMDDHHMMSS>/
-          payload/                # files submitted by Student
+          payload/                # files submitted by the Student
           manifest.json
       reviews/
         <submission-id>/
-          working.docx            # supervisor working copy (Word)
+          working.docx            # Supervisor’s working copy (Word)
           compiled.pdf            # compiled TeX (if built)
           compiled_diff.pdf       # TeX latexdiff PDF (if available)
           returned.docx           # returned Word file
@@ -93,38 +92,35 @@ Students’ Root/
 
 ### Submissions, reviews, and events
 
-* **Submission**: a timestamped snapshot of the Student’s work copied to `submissions/<id>/payload/`.
-* **Review**: all Supervisor output for that submission, under `reviews/<id>/` (working copy, compiled PDFs, comments).
-* **Events**: lightweight markers for “submitted” and “returned” used for status and timelines.
+* **Submission** — a timestamped snapshot of the Student’s work, copied to `submissions/<id>/payload/`.
+* **Review** — all Supervisor outputs for that submission under `reviews/<id>/`.
+* **Events** — lightweight markers for “submitted” and “returned” used for status and timelines.
 
 ### Updates & security
 
-* Both apps can **check for updates**:
-
-  * A **silent** check is performed once shortly after you open the app.
-  * A **manual** check is available via **“Check for updates”**.
-* If you select **Yes** to update, the app:
+* Both apps provide **Check for updates…** (manual).
+* If you choose to update, the app:
 
   1. Downloads the new build from the official GitHub Releases.
-  2. **Verifies a digital signature** (minisign) against a public key embedded in the app.
-  3. If valid, the update is **staged** and the app asks to restart; the executable is replaced **in place** (no move to AppData).
-  4. If invalid or untrusted, the update is **rejected** and nothing changes.
+  2. **Verifies a digital signature** (minisign) against a **public key embedded in the app**.
+  3. If valid, the update is **staged** and the app requests a restart; the executable is replaced **in place**.
+  4. If invalid or untrusted, the update is **rejected**; nothing changes.
 
-> If you select **No** when prompted, **nothing is downloaded** and the app continues as is.
+> If you select **No**, nothing is downloaded and the app continues as is.
 
 ### OneDrive behaviour & performance
 
-Paperforge deliberately uses your existing **OneDrive** for file exchange. This gives you version history, access control, and backups — but it also means:
+Because Paperforge rides on your existing **OneDrive**:
 
-* **Delivery speed depends on OneDrive.** After the Student submits, OneDrive must **upload**; the Supervisor sees it **after download** completes; the same applies in reverse for returns.
-* You may see a **delay** (usually seconds to a few minutes) depending on network conditions and OneDrive’s sync schedule.
+* Delivery speed depends on OneDrive: Student **uploads**, Supervisor **downloads**, and vice versa.
+* Expect a short **delay** (seconds to a few minutes), depending on network and OneDrive’s schedule.
 
-**Recommendations:**
+**Recommendations**
 
-* Ensure OneDrive is **signed in** and syncing: check the tray icon.
+* Ensure OneDrive is **signed in** and syncing (check the tray icon).
 * Prefer **shorter paths** (avoid very deep directory hierarchies).
-* Use “**Always keep on this device**” for your Students’ Root to reduce “cloud placeholder” delays.
-* If in doubt, right-click the OneDrive icon → **Sync** or **Pause/Resume** to nudge it.
+* Right-click the Students’ Root → **Always keep on this device** to avoid “cloud placeholder” issues and speed things up.
+* If in doubt, open the OneDrive menu and press **Sync** or **Pause/Resume** to nudge it.
 
 ---
 
@@ -137,36 +133,43 @@ Paperforge deliberately uses your existing **OneDrive** for file exchange. This 
 
    * **New** → create a manuscript folder (the app initialises an internal repository and writes a minimal `paper.yaml`), or
    * **Open** → select an existing manuscript folder (the app offers to initialise a repository if missing).
-3. **Set/Change Students’ Root…**: point the app to your **class OneDrive root** supplied by your supervisor. Provide:
+3. **Set/Change Students’ Root…** and provide:
 
-   * **Student name** as shown to Supervisor,
-   * **Manuscript slug** (auto-suggested from folder name; lowercase, no spaces).
+   * **Student name** (as seen by the Supervisor),
+   * **Manuscript slug** (auto-suggested from the folder name; lowercase, no spaces).
 
 ### Daily workflow (Student)
 
-1. **Work normally** in your manuscript folder.
-2. **Commit** (Ctrl+S) when you want to checkpoint your state (write a short message).
-3. **Submit** (Ctrl+Enter) when ready for review:
+1. Work normally in your manuscript folder.
+2. **Commit** (Ctrl+S) to checkpoint your state (short message encouraged).
+3. **Submit** (Ctrl+Enter) when ready:
 
-   * The app creates `submissions/<timestamp>/payload/…` under your mapped Students’ Root.
-   * It writes `manifest.json` and a submission event.
-   * OneDrive syncs the new files.
-4. Await the supervisor’s **return**; watch the **Inbox** panel (refresh with **F5**).
+   * The app creates `submissions/<timestamp>/payload/…` in your mapped Students’ Root,
+   * Writes `manifest.json` and a submission event,
+   * OneDrive syncs the files.
+4. **(Optional)** set your **Expected date** (your anticipated date to send the revision). Overdue expected dates are shown **in red** in the Inbox.
+5. Watch the **Inbox** for returns (press **F5** to refresh).
 
 ### Inbox & reviews
 
-* Each returned review appears in the **Inbox** with the submission id and status.
-* Actions:
+* Each return appears in the **Inbox** with submission id and status.
+* **Open selected review**:
 
-  * **Open selected review**: opens `returned.docx` (Word) or `returned.html` (LaTeX).
-  * **Save a copy to working folder**: copies the returned file (and `comments.json` if present) into:
+  * If a **`returned.docx`/`.doc`** exists → the app opens it in your system’s default Word processor.
+  * For **LaTeX** with a **PDF** → the in-app viewer opens the PDF (prefers `*_diff*.pdf` if available).
+  * If only **`returned.html`** exists → your web browser opens it (the dialog still shows comments).
+* **Save a copy to working folder** stores the return under:
 
-    ```
-    <your manuscript>\received_reviews\<submission-id>\
-    ```
+  ```
+  <your manuscript>\received_reviews\<submission-id>\
+  ```
 
+  Save rules:
+
+  * **Word return** → copy **`returned.docx`/`.doc`** and `comments.json` (if present).
+  * **LaTeX with PDF(s)** → copy the **primary PDF** (diff if present, otherwise compiled) and `comments.json`.
+  * **HTML return only** → copy the **entire review folder** so the HTML works **offline** with its assets.
     You’ll be offered to create a **checkpoint commit** for traceability.
-* **Comments preview** (right-hand side) shows `comments.json` in a readable text form.
 
 ### Keyboard shortcuts (Student)
 
@@ -180,14 +183,14 @@ Paperforge deliberately uses your existing **OneDrive** for file exchange. This 
 
 ### Troubleshooting (Student)
 
-* **I don’t see my supervisor’s return in Inbox.**
-  Check your mapping (Students’ Root / name / slug), click **Refresh inbox**, and confirm OneDrive has finished syncing on both sides.
-* **Restore failed or files locked.**
-  Close apps that may be holding files open (Word, PDF viewers, editors), then retry **Restore**.
-* **Update prompt keeps appearing or seems slow.**
-  Choose **No** to skip. If you choose **Yes**, the app verifies and stages the update; once it asks to restart and closes, simply open the app again. If it reports “signature invalid”, the download is discarded.
-* **LaTeX in Inbox shows only `returned.html`.**
-  That’s expected for LaTeX: the Supervisor may return an HTML page that links an embedded or adjacent PDF (compiled or diffed).
+* **I can’t see my Supervisor’s return in the Inbox.**
+  Check your mapping (Students’ Root / name / slug), press **Refresh**, and confirm OneDrive has finished syncing on both sides.
+* **Opening the review doesn’t launch Word.**
+  Ensure the review folder actually contains `returned.docx`/`.doc`. If it is a LaTeX return, the app will open a PDF or `returned.html` instead.
+* **HTML review shows missing assets offline.**
+  Use **Save a copy…** (the app copies the **whole review folder**), then open the HTML from your local copy.
+* **Restore failed or files are locked.**
+  Close Word/PDF viewers/editors that may be holding files open, then retry **Restore**.
 
 ---
 
@@ -196,49 +199,51 @@ Paperforge deliberately uses your existing **OneDrive** for file exchange. This 
 ### First run (Supervisor)
 
 1. Launch `Paperforge-Supervisor.exe`.
-2. **Choose Students’ Root…** and select the shared OneDrive root.
-3. Press **Scan** to populate the tree. You can filter by **Status** (New/In review/Returned), **Type** (Word/LaTeX), or **Search** by Student/Title/Journal/Submission ID.
-4. Enable **Auto-rescan** (every 90s) if you want the list to refresh automatically.
+2. **Choose Students’ Root…** → select the shared OneDrive root.
+3. Press **Scan** to populate the list; filter by **Status** (New / In review / Returned), **Type** (Word / LaTeX), or **Search** by Student / Title / Journal / Submission ID.
+4. Enable **Auto-rescan** (every ~90s) if you want automatic refresh.
+
+> **Important for OneDrive:** For any shared Students’ Root coming from students, right-click the folder and choose **Always keep on this device**. This prevents write failures when OneDrive leaves items as cloud-only placeholders.
 
 ### Reviewing Word submissions
 
 1. Double-click a **Word** submission.
-2. The app copies the submitted `.docx`/`.doc` to `reviews/<id>/working.docx` (or `.doc`) and **opens it** with the system default (usually MS Word).
-3. Save changes in Word as usual. When ready, use **Return selected**:
+2. The app copies the submitted `.docx`/`.doc` to `reviews/<id>/working.docx` (or `.doc`) and **opens it** with your system default (usually Microsoft Word).
+3. Edit and save in Word as usual. When ready, use **Return selected**:
 
-   * The app copies `working.docx` → `returned.docx`.
-   * If no `comments.json` exists, it writes a small default one.
-   * A **returned event** is recorded.
+   * The app copies `working.docx` → `returned.docx`,
+   * Writes a minimal `comments.json` if none exists,
+   * Records a **returned event**.
 
 ### Reviewing LaTeX submissions
 
 1. Double-click a **LaTeX** submission to open the **LaTeX Review Workspace**.
-2. **File list** (left), **editor** (centre), **comments** (right):
+2. Within the workspace:
 
-   * **Save file** to persist edits in the workspace.
-   * **Build PDF** compiles with Tectonic (bundled) and shows the log.
-   * **Add comment from selection** sets the line range automatically from your selection (no selection = current line).
-   * **Save comments** writes `comments.json`.
-3. When returning:
+   * **Save file** to persist edits,
+   * **Build PDF** (bundled Tectonic) and review the build log,
+   * **Add comment from selection** (uses your selection to set the line range; no selection → current line),
+   * **Save comments** to write `comments.json`.
+3. On return:
 
-   * If `latexdiff` is available in `PATH`, the app generates a highlighted diff and builds `compiled_diff.pdf`.
-   * Otherwise, it builds a normal PDF.
-   * It then creates a friendly `returned.html` that links the PDF and lists your comments.
+   * If `latexdiff` is found in `PATH`, the app produces `compiled_diff.pdf`,
+   * Otherwise, it builds a standard `compiled.pdf`,
+   * It then generates a reader-friendly **`returned.html`** that links the PDF and lists your comments.
 
 ### Returning work
 
 * Select one or more submissions → **Return selected**.
-* The app writes the appropriate outputs under `reviews/<id>/…` and records a returned event.
+* Outputs are written under `reviews/<id>/…` and a returned event is recorded.
 * OneDrive syncs the results back to the Student.
 
 ### Troubleshooting (Supervisor)
 
-* **PDF build fails (LaTeX).**
-  Check the **build log** in the workspace. Ensure the correct main `.tex` is open/saved; missing packages will be reported. If necessary, open the log in a separate editor for searching.
+* **LaTeX PDF build fails.**
+  Check the workspace’s **build log**. Ensure the correct main `.tex` is open/saved; missing packages will be listed.
 * **No diff produced.**
-  Install TeX Live or MiKTeX and ensure `latexdiff` is in `PATH`. Without it, the app still returns a standard compiled PDF.
-* **Update dialog blocks the app.**
-  Use the **manual** “Check for updates” button rather than waiting for the silent check. If you choose **Yes**, let it finish staging; the app will close and be ready to relaunch. If you prefer to postpone, choose **No**.
+  Install TeX Live or MiKTeX and ensure `latexdiff` is on `PATH`. Without it, the app still returns a standard compiled PDF.
+* **“Access is denied” when returning.**
+  Set the relevant OneDrive folder to **Always keep on this device**. Also ensure no other app is locking files.
 
 ---
 
@@ -246,48 +251,49 @@ Paperforge deliberately uses your existing **OneDrive** for file exchange. This 
 
 ### When I restore, where do “deleted” files go?
 
-It depends on the restore mode you choose:
+* **Clean restore** — removes files **not** in the snapshot from your working folder (the OS deletes them; Paperforge does not maintain its own recycle bin). You may still recover via OneDrive Version History / Windows File History / backups.
+* **Overlay restore** — overwrites tracked files from the snapshot and **keeps untracked files**.
 
-* **Clean restore**: the app **removes files that are not part of the restored snapshot** from your working folder (e.g. temporary or newly added files outside the repository history).
-
-  * These files are deleted from disk by the operating system. Paperforge does **not** maintain its own recycle bin.
-  * If you rely on **OneDrive Version History**, **Windows File History**, or backups, you may still be able to recover earlier versions.
-
-* **Overlay restore**: the app **overwrites tracked files** with the contents from the chosen commit and **keeps untracked files** in place. Nothing is purposely deleted.
-
-**Recommendation:** if you’re unsure, choose **Overlay**. Use **Clean** only when you know you want a pristine copy of exactly what was tracked in that commit.
+**Recommendation:** If unsure, choose **Overlay**. Use **Clean** only when you need a pristine snapshot.
 
 ### My submission/return is not showing up. Why?
 
-Because the exchange runs over **OneDrive**, there’s an inherent sync delay:
+OneDrive introduces inherent sync delay:
 
 * Student → OneDrive **upload** → Supervisor **download**
-* Supervisor return → OneDrive **upload** → Student **download**
-  Check that both ends are signed in to OneDrive and that the tray icon shows a completed sync. You can also trigger a manual **Sync** from the OneDrive menu.
+* Supervisor → OneDrive **upload** → Student **download**
+
+Ensure both sides are signed in and fully synced; verify your Students’ Root mapping and refresh the list.
 
 ### Will the app move itself into AppData when updating?
 
-No. Updates are **in-place**: the executable in your chosen folder is replaced with the new signed build. The app does **not** relocate itself to AppData.
+No. Updates are **in-place**: the executable in your chosen folder is replaced with the new signed build. The app does **not** relocate into AppData.
 
 ### What happens if an update is tampered with?
 
-Every official release is **digitally signed**. The app verifies the signature against a **public key embedded in the application**. If the signature is invalid, the update is **discarded** and the current version continues to run.
+Every official release is **digitally signed**. The app verifies against a **public key embedded in the application**. If the signature is invalid, the download is **discarded** and the current version continues to run.
 
 ### Can I use the apps without Internet?
 
-You can work locally (editing, committing, restoring) without Internet. Submissions/returns require **OneDrive sync**, so sharing will pause until you’re back online.
+You can work locally (editing, committing, restoring). Submissions/returns require **OneDrive sync**, so sharing pauses until you are back online.
 
 ### Where are my preferences stored?
 
-Per-user application settings (window geometry, recent folders, etc.) are stored using the operating system’s standard user settings mechanism (on Windows, via the registry under your user profile).
+Per-user settings (window geometry, recent folders, etc.) are stored using the OS’s standard mechanism (on Windows, the user registry).
+
+### Why do I see “Access is denied” on return?
+
+This typically occurs when OneDrive has left a cloud-only placeholder. Right-click the relevant Students’ Root (and/or subfolders) → **Always keep on this device**. Also ensure Word/PDF viewers are not holding locks.
 
 ---
 
 ## Good practice & tips
 
-* **Keep path lengths modest.** Deeply nested directories can cause issues with Windows path limits and slow down sync.
-* **Name consistently.** Use clear student names and slugs (lowercase; hyphens instead of spaces).
-* **Commit often.** Small, meaningful checkpoints make **Restore** safer and more predictable.
-* **Use Auto-rescan** during marking sessions (Supervisor) to reduce manual refreshes.
-* **For LaTeX reviewers:** save before build, and consider installing `latexdiff` for richer feedback.
-* **For Students:** when pulling a returned review, accept the prompt to create a commit to anchor that feedback in your history.
+* **Keep path lengths modest** to avoid Windows path limits and to speed up syncing.
+* **Name consistently** (slug in lowercase; use hyphens instead of spaces).
+* **Commit little and often** with clear messages.
+* **Enable Auto-rescan** during marking sessions (Supervisor).
+* **For LaTeX reviewers:** save before building; install `latexdiff` for richer feedback.
+* **For Students:** when saving a return locally, accept the prompt to create a checkpoint so feedback is anchored in your history.
+
+---
